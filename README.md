@@ -23,7 +23,7 @@
 </p>
 
 <p align="center">
-  <sub>Fork of <a href="https://github.com/jmasarweh/UniFi-Insights-Plus">jmasarweh/UniFi-Insights-Plus</a> (upstream <code>main</code>), maintained here since the original went dormant.</sub>
+  <sub>Fork of <a href="https://github.com/jmasarweh/UniFi-Insights-Plus">jmasarweh/UniFi-Insights-Plus</a>. Fork maintained independently by leto1210, with upstream compatibility preserved where practical.</sub>
 </p>
 
 <p align="center">
