@@ -1,10 +1,21 @@
 import { useState, useEffect, useMemo } from 'react'
 import { fetchAllReleases } from '../api'
 
+// Rewrite legacy references baked into older GitHub release bodies (the
+// upstream repo we forked from and its retired docs site) so the modal shows
+// links that resolve against the active fork instead.
+export function scrubUpstreamRefs(md) {
+  if (!md) return md
+  return md
+    .replace(/jmasarweh\/UniFi-Insights-Plus/gi, 'leto1210/Unifi-Log-Insights')
+    .replace(/\[([^\]]+)\]\(https?:\/\/(?:www\.)?insightsplus\.dev[^)]*\)/gi, '$1')
+    .replace(/https?:\/\/(?:www\.)?insightsplus\.dev\S*/gi, '')
+}
+
 export function renderMarkdown(md) {
   if (!md) return ''
   const esc = s => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
-  return esc(md)
+  return esc(scrubUpstreamRefs(md))
     .replace(/^#### (.+)$/gm, '<h4 class="text-sm font-medium text-gray-300 mt-2 mb-0.5">$1</h4>')
     .replace(/^### (.+)$/gm, '<h3 class="text-sm font-semibold text-gray-200 mt-2 mb-0.5">$1</h3>')
     .replace(/^## (.+)$/gm, '<h2 class="text-sm font-semibold text-gray-100 mt-3 mb-1">$1</h2>')
