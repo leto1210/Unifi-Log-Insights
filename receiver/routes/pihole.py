@@ -6,6 +6,7 @@ from fastapi import APIRouter, HTTPException
 
 from db import get_config, set_config, encrypt_api_key
 from deps import enricher_db, signal_receiver, pihole_poller
+from pihole_api import _validate_pihole_url
 
 logger = logging.getLogger('api.pihole')
 
@@ -33,6 +34,15 @@ def update_pihole_settings(body: dict):
     if 'enrichment' in body:
         if body['enrichment'] not in ('none', 'geoip', 'threat', 'both'):
             raise HTTPException(400, 'enrichment must be one of: none, geoip, threat, both')
+    
+    # Validate host URL if provided
+    if 'host' in body:
+        raw_host = body['host']
+        if raw_host:
+            try:
+                _validate_pihole_url(raw_host)
+            except ValueError as e:
+                raise HTTPException(400, str(e))
 
     # All valid — persist
     current_host = get_config(enricher_db, 'pihole_host', '')

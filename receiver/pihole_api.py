@@ -63,6 +63,50 @@ def _is_private(ip_str):
         return True
 
 
+def _validate_pihole_url(url: str) -> str:
+    """Validate and normalize a Pi-hole URL for SSRF protection.
+    
+    Returns the normalized URL (without trailing slash) on success.
+    Raises ValueError with a generic error message on validation failure.
+    """
+    if not url:
+        raise ValueError("Invalid URL")
+    
+    try:
+        parsed = urlparse(url)
+        
+        # Protocol validation: only http and https allowed
+        if parsed.scheme not in ('http', 'https'):
+            raise ValueError("Invalid URL")
+        
+        # Domain allowlist - add your allowed domains here
+        allowed_domains = ['example.com']  # add your allowed domains here
+        
+        # Extract hostname (without port)
+        hostname = parsed.hostname
+        if not hostname:
+            raise ValueError("Invalid URL")
+        
+        # Check if hostname is in the allowlist (exact match only, no subdomains)
+        if hostname not in allowed_domains:
+            raise ValueError("Invalid URL")
+        
+        # Reconstruct the URL to ensure it's properly formatted
+        # Include port if specified
+        if parsed.port:
+            netloc = f"{hostname}:{parsed.port}"
+        else:
+            netloc = hostname
+        
+        # Reconstruct without trailing slash
+        normalized = f"{parsed.scheme}://{netloc}{parsed.path.rstrip('/')}"
+        
+        return normalized
+        
+    except (AttributeError, TypeError):
+        raise ValueError("Invalid URL")
+
+
 class _DNSCache:
     """Simple TTL cache for DNS resolution results, keyed by (domain, qtype)."""
 
@@ -142,8 +186,18 @@ class PiHolePoller:
 
     def _resolve_config(self):
         """Load settings: env var > system_config DB > default."""
-        self.host = (os.environ.get('PIHOLE_HOST') or
-                     self._db.get_config('pihole_host', '')).rstrip('/')
+        raw_host = (os.environ.get('PIHOLE_HOST') or
+                    self._db.get_config('pihole_host', ''))
+        
+        # Validate and normalize the host URL
+        if raw_host:
+            try:
+                self.host = _validate_pihole_url(raw_host)
+            except ValueError:
+                logger.warning("Invalid Pi-hole host URL, disabling Pi-hole integration")
+                self.host = ''
+        else:
+            self.host = ''
 
         # Password: env var overrides encrypted DB value
         env_password = os.environ.get('PIHOLE_PASSWORD', '')
@@ -814,11 +868,17 @@ class PiHolePoller:
         Can be called with explicit host/password (from Settings wizard)
         or uses stored config.
         """
-        test_host = (host or self.host).rstrip('/')
+        raw_host = host or self.host
         test_password = password or self._password
 
-        if not test_host or not test_password:
+        if not raw_host or not test_password:
             return {'success': False, 'error': 'Host and password are required'}
+
+        # Validate the host URL for SSRF protection
+        try:
+            test_host = _validate_pihole_url(raw_host)
+        except ValueError as e:
+            return {'success': False, 'error': str(e)}
 
         session = requests.Session()
         session.verify = False
