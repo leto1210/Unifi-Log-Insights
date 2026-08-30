@@ -17,11 +17,14 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y wget pandoc
+      - name: Verify script content
+        run: head -20 .github/scripts/fetch_docs.sh
       - name: Ensure script is executable
         run: chmod +x .github/scripts/fetch_docs.sh
       - name: Run fetch script
         env:
           BASE_URL: https://insightsplus.dev/docs
-        run: ./.github/scripts/fetch_docs.sh
+        run: bash -x ./.github/scripts/fetch_docs.sh 2>&1 | tail -100
       - name: Show any changes
         run: git --no-pager status --porcelain
+
