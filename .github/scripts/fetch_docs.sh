@@ -15,23 +15,42 @@ wget --mirror --convert-links --adjust-extension --page-requisites --no-parent -
 SRC_DIR=$(find "$TMPDIR" -maxdepth 3 -type d -name "insightsplus.dev" -print | head -n1 || true)
 if [ -z "$SRC_DIR" ]; then
   echo "Could not find mirrored site under $TMPDIR"
+  echo "Contents of $TMPDIR:"
   ls -la "$TMPDIR"
   exit 1
 fi
 
+echo "Found mirrored site at: $SRC_DIR"
+
+# Try to find the docs subdirectory
 SRC_DOCS="$SRC_DIR/docs"
 if [ ! -d "$SRC_DOCS" ]; then
-  # sometimes wget places pages directly under the domain root
+  echo "No docs/ subdirectory, using domain root"
   SRC_DOCS="$SRC_DIR"
 fi
 
+echo "Looking for HTML files in: $SRC_DOCS"
+HTML_COUNT=$(find "$SRC_DOCS" -type f -name '*.html' | wc -l)
+echo "Found $HTML_COUNT HTML files"
+
+if [ "$HTML_COUNT" -eq 0 ]; then
+  echo "Error: No HTML files found in $SRC_DOCS"
+  echo "Directory structure:"
+  find "$SRC_DOCS" -type f | head -20
+  exit 1
+fi
+
 # Convert HTML files to markdown using pandoc
+CONVERSION_FAILED=0
 find "$SRC_DOCS" -type f -name '*.html' | while read -r html; do
   rel=$(realpath --relative-to="$SRC_DOCS" "$html")
   md="$OUTDIR/${rel%.html}.md"
   mkdir -p "$(dirname "$md")"
   echo "Converting $html -> $md"
-  pandoc -f html -t gfm --wrap=preserve "$html" -o "$md" || { echo "pandoc failed for $html"; exit 1; }
+  if ! pandoc -f html -t gfm --wrap=preserve "$html" -o "$md" 2>&1; then
+    echo "ERROR: pandoc failed for $html"
+    exit 1
+  fi
   # Prepend attribution/frontmatter
   tmpfile=$(mktemp)
   echo "---" > "$tmpfile"
@@ -43,6 +62,9 @@ find "$SRC_DOCS" -type f -name '*.html' | while read -r html; do
   cat "$md" >> "$tmpfile"
   mv "$tmpfile" "$md"
 done
+if [ $? -ne 0 ]; then
+  exit 1
+fi
 
 # Copy image assets
 find "$SRC_DOCS" -type f \( -iname '*.png' -o -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.gif' -o -iname '*.svg' \) -print0 | while IFS= read -r -d '' img; do
