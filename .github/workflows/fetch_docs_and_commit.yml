@@ -1,0 +1,27 @@
+name: Import InsightsPlus Docs
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - import/insightsplus-docs
+
+jobs:
+  import:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y wget pandoc
+      - name: Ensure script is executable
+        run: chmod +x .github/scripts/fetch_docs.sh
+      - name: Run fetch script
+        env:
+          BASE_URL: https://insightsplus.dev/docs
+        run: ./.github/scripts/fetch_docs.sh
+      - name: Show any changes
+        run: git --no-pager status --porcelain

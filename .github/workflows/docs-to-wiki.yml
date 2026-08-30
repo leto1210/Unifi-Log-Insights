@@ -1,0 +1,35 @@
+name: Sync docs to wiki
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'docs/**'
+    branches:
+      - main
+      - master
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install git
+        run: sudo apt-get update && sudo apt-get install -y git
+      - name: Sync to wiki
+        env:
+          WIKI_PAT: ${{ secrets.WIKI_PAT }}
+          REPO: ${{ github.repository }}
+        run: |
+          if [ -z "$WIKI_PAT" ]; then
+            echo "WIKI_PAT not set. Skipping wiki push. Create a repo secret named WIKI_PAT with a token that can push to the wiki repo."
+            exit 0
+          fi
+          git clone https://x-access-token:${WIKI_PAT}@github.com/${REPO}.wiki.git wiki-repo
+          rm -rf wiki-repo/* || true
+          cp -R docs/* wiki-repo/
+          cd wiki-repo
+          git add .
+          git commit -m "Sync docs to wiki (automated)" || echo "No changes to commit"
+          git push origin HEAD
