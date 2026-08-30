@@ -5,6 +5,7 @@ import logging
 import os
 import queue
 import threading
+from urllib.parse import urlparse
 
 import requests as _requests
 from requests.exceptions import ConnectionError as RequestsConnectionError, SSLError
@@ -27,6 +28,40 @@ _ERR_CONNECTION = "Could not connect to the UniFi Controller. Check that the hos
 _ERR_BULK = "Bulk update failed. One or more policies could not be processed. Check the container logs for details."
 
 router = APIRouter()
+
+
+def _validate_unifi_host(host: str) -> str:
+    """Validate UniFi controller host URL against SSRF attacks.
+    
+    Returns the validated host URL or raises ValueError.
+    Implements domain allowlisting as the primary SSRF defense.
+    """
+    try:
+        # Parse the URL
+        parsed = urlparse(host)
+        
+        # Validate protocol (http/https only)
+        if parsed.scheme not in ('http', 'https'):
+            raise ValueError('Invalid URL')
+        
+        # Validate domain against allowlist
+        hostname = parsed.hostname
+        if not hostname:
+            raise ValueError('Invalid URL')
+        
+        # Domain allowlist - add your allowed domains here
+        allowed_domains = ['example.com']  # add your allowed domains here
+        
+        # Check if hostname matches any allowed domain (exact match only)
+        if hostname not in allowed_domains:
+            raise ValueError('Invalid URL')
+        
+        return host
+        
+    except ValueError:
+        raise
+    except Exception:
+        raise ValueError('Invalid URL')
 
 
 def _seed_network_identity():
@@ -56,7 +91,15 @@ def update_unifi_settings(body: dict):
     if 'enabled' in body:
         set_config(enricher_db, 'unifi_enabled', body['enabled'])
     if 'host' in body:
-        set_config(enricher_db, 'unifi_host', body['host'])
+        host_val = body['host']
+        if host_val:
+            try:
+                validated_host = _validate_unifi_host(host_val)
+                set_config(enricher_db, 'unifi_host', validated_host)
+            except ValueError:
+                raise HTTPException(status_code=400, detail='Invalid URL')
+        else:
+            set_config(enricher_db, 'unifi_host', host_val)
     if 'controller_type' in body:
         set_config(enricher_db, 'unifi_controller_type', body['controller_type'])
     if 'api_key' in body:

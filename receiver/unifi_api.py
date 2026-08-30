@@ -12,6 +12,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
+from urllib.parse import urlparse
 
 import requests
 from requests.exceptions import ConnectionError, Timeout, SSLError
@@ -348,6 +349,40 @@ class UniFiAPI:
 
     # ── Phase 1: Connection & Config ──────────────────────────────────────────
 
+    @staticmethod
+    def _validate_unifi_host(host: str) -> str:
+        """Validate UniFi controller host URL against SSRF attacks.
+        
+        Returns the validated host URL or raises ValueError.
+        Implements domain allowlisting as the primary SSRF defense.
+        """
+        try:
+            # Parse the URL
+            parsed = urlparse(host)
+            
+            # Validate protocol (http/https only)
+            if parsed.scheme not in ('http', 'https'):
+                raise ValueError('Invalid URL')
+            
+            # Validate domain against allowlist
+            hostname = parsed.hostname
+            if not hostname:
+                raise ValueError('Invalid URL')
+            
+            # Domain allowlist - add your allowed domains here
+            allowed_domains = ['example.com']  # add your allowed domains here
+            
+            # Check if hostname matches any allowed domain (exact match only)
+            if hostname not in allowed_domains:
+                raise ValueError('Invalid URL')
+            
+            return host
+            
+        except ValueError:
+            raise
+        except Exception:
+            raise ValueError('Invalid URL')
+
     def test_connection(self, host: str, site: str = 'default',
                         verify_ssl: bool = True, controller_type: str = 'unifi_os',
                         api_key: str | None = None, username: str | None = None,
@@ -361,9 +396,12 @@ class UniFiAPI:
         host = host.rstrip('/')
 
         try:
+            # Validate host URL to prevent SSRF
+            validated_host = self._validate_unifi_host(host)
+            
             if controller_type == 'self_hosted':
-                return self._test_self_hosted(host, site, verify_ssl, username, password)
-            return self._test_unifi_os(host, site, verify_ssl, api_key)
+                return self._test_self_hosted(validated_host, site, verify_ssl, username, password)
+            return self._test_unifi_os(validated_host, site, verify_ssl, api_key)
 
         except SSLError:
             return {'success': False,
@@ -387,6 +425,10 @@ class UniFiAPI:
             return {'success': False,
                     'error': f'Controller returned error: {status}',
                     'error_code': 'invalid_response'}
+        except ValueError:
+            return {'success': False,
+                    'error': 'Invalid URL',
+                    'error_code': 'invalid_url'}
         except Exception as e:
             return {'success': False,
                     'error': str(e),

@@ -6,6 +6,7 @@ import os
 import threading
 from datetime import datetime, timezone
 from typing import Optional
+from urllib.parse import urlparse
 
 from fastapi import APIRouter, HTTPException
 from psycopg2.extras import RealDictCursor, Json
@@ -23,6 +24,40 @@ from query_helpers import validate_view_filters
 logger = logging.getLogger('api.setup')
 
 router = APIRouter()
+
+
+def _validate_unifi_host(host: str) -> str:
+    """Validate UniFi controller host URL against SSRF attacks.
+    
+    Returns the validated host URL or raises ValueError.
+    Implements domain allowlisting as the primary SSRF defense.
+    """
+    try:
+        # Parse the URL
+        parsed = urlparse(host)
+        
+        # Validate protocol (http/https only)
+        if parsed.scheme not in ('http', 'https'):
+            raise ValueError('Invalid URL')
+        
+        # Validate domain against allowlist
+        hostname = parsed.hostname
+        if not hostname:
+            raise ValueError('Invalid URL')
+        
+        # Domain allowlist - add your allowed domains here
+        allowed_domains = ['example.com']  # add your allowed domains here
+        
+        # Check if hostname matches any allowed domain (exact match only)
+        if hostname not in allowed_domains:
+            raise ValueError('Invalid URL')
+        
+        return host
+        
+    except ValueError:
+        raise
+    except Exception:
+        raise ValueError('Invalid URL')
 
 
 def _read_dismissed_list(config_key: str) -> list:
@@ -565,6 +600,13 @@ def import_config(body: dict):
                 failed_keys.append(key)
                 continue
             val = parsed
+        elif key == 'unifi_host':
+            if val:
+                try:
+                    val = _validate_unifi_host(val)
+                except ValueError:
+                    failed_keys.append(key)
+                    continue
         set_config(enricher_db, key, val)
         imported_keys.append(key)
 
