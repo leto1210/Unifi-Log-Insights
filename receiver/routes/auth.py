@@ -44,10 +44,14 @@ PROXY_AUTH_TOKEN = _derive_proxy_token()
 
 
 def log_proxy_token() -> None:
-    """Log the proxy auth token.  Must be called after logging.basicConfig()."""
+    """Log the proxy auth token prefix for verification.  Must be called after logging.basicConfig()."""
+    # Only log a prefix to prevent credential disclosure in logs while still
+    # allowing operators to verify the token is being derived correctly.
+    # Full token retrieval requires authenticated admin access to /api/auth/proxy-token.
+    token_prefix = PROXY_AUTH_TOKEN[:12] if len(PROXY_AUTH_TOKEN) >= 12 else PROXY_AUTH_TOKEN
     logger.info(
-        "Proxy auth token (X-ULI-Proxy-Auth): %s  — configure your reverse proxy with this value",
-        PROXY_AUTH_TOKEN,
+        "Proxy auth token prefix (X-ULI-Proxy-Auth): %s...  — retrieve full token via /api/auth/proxy-token endpoint (admin access required)",
+        token_prefix,
     )
 
 
@@ -398,11 +402,10 @@ def auth_status(request: Request):
         "setup_complete": setup_result.get('setup_complete', False),
         "session_ttl_hours": int(get_config(enricher_db, 'auth_session_ttl_hours', 168) or 168),
     }
-    # Expose proxy token only when auth is not active — the app is already
-    # fully unprotected at this point, so no additional risk.  Once auth is
-    # enabled this field is omitted; users get it from the admin-only endpoint.
-    if not auth_enabled:
-        result["proxy_token"] = PROXY_AUTH_TOKEN
+    # Never expose the proxy token via unauthenticated endpoints.
+    # The token is a bearer credential that can bypass HTTPS requirements and
+    # spoof client IPs. Operators must retrieve it via the authenticated
+    # /api/auth/proxy-token endpoint (admin session required).
     return result
 
 
@@ -427,10 +430,15 @@ def get_proxy_token(request: Request):
 @router.post("/api/auth/setup")
 def auth_setup(request: Request, body: dict):
     """Create first user. Only works when no users exist."""
-    _require_https(request)
-
+    # Check if users already exist BEFORE checking HTTPS to prevent
+    # information disclosure about setup state via HTTPS error messages.
     if _has_users():
         raise HTTPException(400, "Setup already completed. Users already exist.")
+    
+    # For first-admin setup, require actual HTTPS connection.
+    # Defense in depth: even if proxy token leaks, attacker cannot use it
+    # to bypass HTTPS for this critical operation.
+    _require_https(request)
 
     username = (body.get('username') or '').strip()
     password = body.get('password') or ''
