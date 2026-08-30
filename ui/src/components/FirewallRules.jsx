@@ -791,9 +791,7 @@ export default function FirewallRules() {
 
     setToggling(true)
     try {
-      const policies = eligible
-        .filter(p => p.id)  // drop items with no id — belt-and-suspenders vs backend guard
-        .map(p => ({ id: p.id, loggingEnabled: enableAll }))
+      const policies = eligible.map(p => ({ id: p.id, loggingEnabled: enableAll }))
       const result = await bulkUpdateFirewallLoggingStream(policies, makeProgressCallback())
       setBulkProgress(null)
       await loadPolicies()
@@ -821,9 +819,7 @@ export default function FirewallRules() {
     setBulkAction(enableAll ? 'enable' : 'disable')
     setBulkProgress({ completed: 0, total: eligible.length, success: 0, failed: 0, phase: 'patching' })
     try {
-      const policies = eligible
-        .filter(p => p.id)  // drop items with no id — belt-and-suspenders vs backend guard
-        .map(p => ({ id: p.id, loggingEnabled: enableAll }))
+      const policies = eligible.map(p => ({ id: p.id, loggingEnabled: enableAll }))
       const result = await bulkUpdateFirewallLoggingStream(policies, makeProgressCallback())
       setBulkProgress(null)
       setPendingBulk(null)

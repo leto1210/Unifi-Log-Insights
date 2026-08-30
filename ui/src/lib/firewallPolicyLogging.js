@@ -10,6 +10,12 @@ export function isControllablePolicy(policy) {
   if (!policy) return false
   if (policy.metadata?.origin === 'DERIVED') return false
   if (policy.enabled === false) return false
+  // Some UDM policies (observed: certain USER_DEFINED "Allow X to All"
+  // grouped rules) come back from the Integration API with no `id` field
+  // at all. They can't be PATCHed — the API surface treats them as
+  // read-only. Filter them out so the UI doesn't show a toggle we know
+  // can't succeed.
+  if (!policy.id) return false
   return true
 }
 
