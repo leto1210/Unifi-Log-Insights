@@ -7,7 +7,7 @@ import threading
 from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from psycopg2.extras import RealDictCursor, Json
 
 from db import Database, get_config, set_config, count_logs, encrypt_api_key, decrypt_api_key, parse_retention_time
@@ -453,11 +453,12 @@ _API_KEY_CONFIG_KEY = 'unifi_api_key'
 
 
 @router.get("/api/config/export")
-def export_config(include_api_key: bool = False):
+def export_config(request: Request, include_api_key: bool = False):
     """Export user configuration as JSON.
 
     Query params:
         include_api_key: if true, decrypts and includes the UniFi API key in plaintext.
+                        Requires session-authenticated admin user (not API tokens).
     """
     config = {}
     for key in _EXPORTABLE_KEYS:
@@ -467,6 +468,24 @@ def export_config(include_api_key: bool = False):
 
     includes_api_key = False
     if include_api_key:
+        # API key export requires admin session authentication (not API tokens)
+        auth_info = getattr(request.state, 'auth_info', None)
+        
+        # When auth is disabled, allow export (single-user mode, no privilege escalation risk)
+        if auth_info is not None:
+            # Auth is enabled — enforce admin-only access
+            if not auth_info.get('user_id'):
+                raise HTTPException(401, "Session authentication required to export API key")
+            
+            # Reject API token authentication — sensitive credential export requires interactive admin
+            if auth_info.get('token_id'):
+                raise HTTPException(403, "Session authentication required — API tokens cannot export the UniFi API key")
+            
+            # Require admin role
+            if auth_info.get('role_name') != 'admin':
+                raise HTTPException(403, "Admin role required to export API key")
+        
+        # Authorization passed — decrypt and include the API key
         encrypted = get_config(enricher_db, _API_KEY_CONFIG_KEY, '')
         if encrypted:
             decrypted = decrypt_api_key(encrypted)
