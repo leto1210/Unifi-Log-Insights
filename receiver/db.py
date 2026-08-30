@@ -757,6 +757,17 @@ END $$;""",
                                 "Check object ownership and grant privileges to the app DB user.",
                                 sql,
                             )
+                        except psycopg2.errors.CantChangeRuntimeParam as e:
+                            # ALTER DATABASE ... SET on GUCs like log_autovacuum_min_duration
+                            # can fail if the current role isn't superuser or if the parameter's
+                            # context bars the change from this session. Non-fatal — the tuning
+                            # is best-effort observability, not required for correctness.
+                            cur.execute(f"ROLLBACK TO SAVEPOINT sp_{i}")
+                            logger.warning(
+                                "Migration skipped (parameter cannot be changed now): %s. "
+                                "Set it manually as DB superuser if you need it.",
+                                e.diag.message_primary or e,
+                            )
                         except psycopg2.errors.UniqueViolation as e:
                             cur.execute(f"ROLLBACK TO SAVEPOINT sp_{i}")
                             if e.diag.constraint_name and "pg_type" in e.diag.constraint_name:
