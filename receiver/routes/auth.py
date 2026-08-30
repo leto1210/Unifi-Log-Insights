@@ -429,16 +429,40 @@ def get_proxy_token(request: Request):
 
 @router.post("/api/auth/setup")
 def auth_setup(request: Request, body: dict):
-    """Create first user. Only works when no users exist."""
-    # Fast path — checks the common case before HTTPS enforcement to avoid
-    # info-disclosure via HTTPS error messages. The authoritative check
-    # (with advisory lock, TOCTOU-safe) runs inside the transaction below.
+    """Create first user. Only works when no users exist and valid setup token provided."""
+    # Gate everything on a valid SETUP_TOKEN first — this blocks anonymous
+    # scans before they can observe setup state or HTTPS error messages.
+    # Rate-limit by client IP to blunt token brute-force.
+    ip = get_real_client_ip(request)
+    _check_rate_limit(ip)
+
+    setup_token = os.environ.get('SETUP_TOKEN', '').strip()
+    if not setup_token:
+        raise HTTPException(
+            403,
+            "Setup endpoint is disabled. Set the SETUP_TOKEN environment variable to enable first-time enrollment. "
+            "See the authentication documentation for secure deployment instructions."
+        )
+
+    provided_token = request.headers.get('x-setup-token', '').strip()
+    if not provided_token:
+        raise HTTPException(
+            401,
+            "Setup token required. Provide the SETUP_TOKEN value in the X-Setup-Token header."
+        )
+    if not _hmac.compare_digest(setup_token, provided_token):
+        _record_attempt(ip)
+        raise HTTPException(401, "Invalid setup token")
+
+    # Fast path — only reachable after a valid token, so the response
+    # doesn't leak setup state to anonymous callers. The authoritative
+    # check (advisory-locked, TOCTOU-safe) runs inside the transaction.
     if _has_users():
         raise HTTPException(400, "Setup already completed. Users already exist.")
 
     # For first-admin setup, require actual HTTPS connection.
-    # Defense in depth: even if proxy token leaks, attacker cannot use it
-    # to bypass HTTPS for this critical operation.
+    # Defense in depth: even with a valid SETUP_TOKEN, first-admin
+    # credentials must travel over TLS.
     _require_https(request)
 
     username = (body.get('username') or '').strip()
@@ -458,11 +482,11 @@ def auth_setup(request: Request, body: dict):
         with conn.cursor() as cur:
             # Acquire advisory lock to serialize concurrent setup attempts.
             # Lock ID 1000001 is arbitrary but deterministic for the setup operation.
-            # This prevents TOCTOU races where multiple requests could observe an empty
-            # user table and both attempt to create admin accounts.
+            # Advisory lock is preferred over LOCK TABLE users EXCLUSIVE because
+            # it doesn't block SELECT on the users table from other sessions.
             cur.execute("SELECT pg_advisory_xact_lock(1000001)")
-            
-            # Recheck user existence within the locked transaction
+
+            # Recheck user existence within the locked transaction (TOCTOU-safe)
             cur.execute("SELECT EXISTS(SELECT 1 FROM users WHERE is_active = true)")
             if cur.fetchone()[0]:
                 raise HTTPException(400, "Setup already completed. Users already exist.")

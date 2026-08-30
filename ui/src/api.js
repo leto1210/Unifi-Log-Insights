@@ -540,10 +540,14 @@ export async function authLogin(username, password) {
   return resp.json()
 }
 
-export async function authSetup(username, password) {
+export async function authSetup(username, password, setupToken) {
+  const headers = { 'Content-Type': 'application/json' }
+  if (setupToken) {
+    headers['X-Setup-Token'] = setupToken
+  }
   return apiFetch(`${BASE}/auth/setup`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers,
     body: JSON.stringify({ username, password })
   })
 }
