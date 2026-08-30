@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -uo pipefail  # Remove 'e' - we'll handle errors explicitly
+set -uo pipefail
 
 BASE_URL="${BASE_URL:-https://insightsplus.dev/docs}"
 TMPDIR=$(mktemp -d)
@@ -8,7 +8,7 @@ ASSET_DIR="$OUTDIR/assets"
 mkdir -p "$TMPDIR" "$OUTDIR" "$ASSET_DIR"
 
 echo "Mirroring $BASE_URL"
-wget --mirror --convert-links --adjust-extension --page-requisites --no-parent --restrict-file-names=windows --domains insightsplus.dev "$BASE_URL" -P "$TMPDIR" 2>&1 | tail -5
+wget --mirror --convert-links --adjust-extension --page-requisites --no-parent --restrict-file-names=windows --domains insightsplus.dev "$BASE_URL" -P "$TMPDIR" >/dev/null 2>&1
 
 # Find the mirrored domain directory
 SRC_DIR=$(find "$TMPDIR" -maxdepth 3 -type d -name "insightsplus.dev" 2>/dev/null | head -n1)
@@ -18,19 +18,19 @@ if [ -z "$SRC_DIR" ]; then
 fi
 echo "Found mirrored site at: $SRC_DIR"
 
-# Locate HTML files (try docs subdirectory first, then domain root)
+# Locate HTML files
 SRC_DOCS="$SRC_DIR/docs"
 [ -d "$SRC_DOCS" ] || SRC_DOCS="$SRC_DIR"
-echo "Converting HTML files from: $SRC_DOCS"
+echo "Source directory: $SRC_DOCS"
 
 # Convert HTML files using pandoc
-MD_COUNT=0
-find "$SRC_DOCS" -type f -name '*.html' -print0 2>/dev/null | while IFS= read -r -d '' html; do
+echo "Converting HTML to Markdown..."
+find "$SRC_DOCS" -type f -name '*.html' 2>/dev/null | while read -r html; do
   rel=$(realpath --relative-to="$SRC_DOCS" "$html" 2>/dev/null || basename "$html")
   md="$OUTDIR/${rel%.html}.md"
   mkdir -p "$(dirname "$md")"
   
-  if pandoc -f html -t gfm --wrap=preserve "$html" -o "$md" 2>/dev/null; then
+  if pandoc -f html -t gfm --wrap=preserve "$html" -o "$md" 2>&1; then
     # Add attribution frontmatter
     {
       echo "---"
@@ -41,19 +41,16 @@ find "$SRC_DOCS" -type f -name '*.html' -print0 2>/dev/null | while IFS= read -r
       echo ""
       cat "$md"
     } > "$md.tmp" && mv "$md.tmp" "$md"
-    ((MD_COUNT++))
   fi
 done
-echo "✓ Converted $MD_COUNT markdown files"
 
 # Copy image assets
-find "$SRC_DOCS" -type f \( -iname '*.png' -o -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.gif' -o -iname '*.svg' \) -print0 2>/dev/null | while IFS= read -r -d '' img; do
+find "$SRC_DOCS" -type f \( -iname '*.png' -o -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.gif' -o -iname '*.svg' \) 2>/dev/null | while read -r img; do
   rel=$(realpath --relative-to="$SRC_DOCS" "$img" 2>/dev/null || basename "$img")
   dest="$ASSET_DIR/$rel"
   mkdir -p "$(dirname "$dest")"
   cp "$img" "$dest" 2>/dev/null || true
 done
-echo "✓ Assets copied to $ASSET_DIR"
 
 # Commit and push
 git config user.name "github-actions[bot]"
@@ -61,10 +58,10 @@ git config user.email "github-actions[bot]@users.noreply.github.com"
 git add docs || true
 
 if git diff --cached --quiet; then
-  echo "✓ No docs changes to commit"
+  echo "No changes to commit"
 else
   git commit -m "Automated import of InsightsPlus docs from $BASE_URL"
-  git push origin HEAD || echo "Warning: Push failed (may already be up-to-date)"
+  git push origin HEAD
 fi
 
-echo "✓ Import complete!"
+echo "Done!"
