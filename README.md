@@ -23,6 +23,10 @@
 </p>
 
 <p align="center">
+  <sub>Fork of <a href="https://github.com/jmasarweh/UniFi-Insights-Plus">jmasarweh/UniFi-Insights-Plus</a> (upstream <code>main</code>), maintained here since the original went dormant.</sub>
+</p>
+
+<p align="center">
   <strong>For full documentation, visit the <a href="https://github.com/leto1210/Unifi-Log-Insights/wiki">project wiki</a></strong>
 </p>
 
