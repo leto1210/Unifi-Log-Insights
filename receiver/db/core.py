@@ -1,237 +1,63 @@
-"""
-UniFi Log Insight - Database Module
+"""The :class:`Database` class — connection pool and all persistence operations.
 
-Handles PostgreSQL connection pooling, log insertion, and retention cleanup.
+Module split notes:
+    * SQL migration text lives in :mod:`.schema`.
+    * INSERT column list and INSERT SQL live in :mod:`.logs_sql`.
+    * Retention parsers, NamedTuples and defaults live in :mod:`.retention`.
+    * ``AdGuardHostMismatch`` lives in :mod:`.exceptions`.
+    * Module-level ``get_config`` / ``set_config`` / ``get_wan_ips_from_config``
+      / ``parse_vpn_config`` / API-key crypto helpers live in :mod:`.config`.
+    * Connection param helpers (``build_conn_params`` / ``is_external_db`` /
+      ``wait_for_postgres`` / ``_normalize_db_host``) live in :mod:`.connection`.
+
+The class body itself is intact — the methods and their contents were not
+modified during the split.
 """
 
-import base64
 import ipaddress
+import logging
 import os
 import sys
-import json
-import logging
 import time
 from contextlib import contextmanager
-from typing import NamedTuple, Optional
+from typing import Optional
 
 import psycopg2
 import psycopg2.errors
 from psycopg2 import pool, extras
 from psycopg2.extras import Json
 
-logger = logging.getLogger(__name__)
+from .connection import build_conn_params
+from .config import get_wan_ips_from_config
+from .exceptions import AdGuardHostMismatch
+from .logs_sql import INSERT_COLUMNS, INSERT_SQL
+from .retention import (
+    RETENTION_TIME_DEFAULT,
+    RetentionDaysConfig,
+    RetentionTimeConfig,
+    parse_retention_days,
+    parse_retention_time,
+)
+from . import schema as _schema
 
 
-class AdGuardHostMismatch(Exception):
-    """Raised by insert_adguard_batch when the DB host differs from the expected host.
+class _PackageLoggerProxy:
+    """Delegates every attribute access to ``db.logger`` at call time.
 
-    This indicates a config change landed between the start of _poll() and the
-    DB commit — the batch is discarded to prevent cursor corruption.
+    Tests do ``monkeypatch.setattr(db_module, 'logger', fake)`` to capture
+    output from :meth:`Database._ensure_schema` and friends — routing through
+    the proxy keeps those patches effective now that the methods live in a
+    submodule that would otherwise have its own bound ``logger`` name.
     """
 
+    __slots__ = ()
 
-# ── API Key Encryption ────────────────────────────────────────────────────────
-
-def _derive_fernet_key(postgres_password: str) -> bytes:
-    """Derive a Fernet encryption key from POSTGRES_PASSWORD."""
-    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
-    from cryptography.hazmat.primitives import hashes
-    kdf = PBKDF2HMAC(
-        algorithm=hashes.SHA256(),
-        length=32,
-        salt=b'unifi-log-insight-v1',
-        iterations=100_000,
-    )
-    return base64.urlsafe_b64encode(kdf.derive(postgres_password.encode()))
+    def __getattr__(self, name):
+        import db as _pkg  # resolved lazily; the package is loaded by call time
+        return getattr(_pkg.logger, name)
 
 
-def _get_secret_key() -> str:
-    """Return the encryption secret: SECRET_KEY > POSTGRES_PASSWORD > DB_PASSWORD."""
-    return (os.environ.get('SECRET_KEY')
-            or os.environ.get('POSTGRES_PASSWORD')
-            or os.environ.get('DB_PASSWORD', ''))
-
-
-def encrypt_api_key(api_key: str) -> str:
-    """Encrypt API key for storage in system_config."""
-    from cryptography.fernet import Fernet
-    secret = _get_secret_key()
-    if not secret:
-        raise ValueError("SECRET_KEY or POSTGRES_PASSWORD required for encryption")
-    f = Fernet(_derive_fernet_key(secret))
-    return f.encrypt(api_key.encode()).decode()
-
-
-def decrypt_api_key(encrypted: str) -> str:
-    """Decrypt API key from system_config. Returns empty string on failure."""
-    from cryptography.fernet import Fernet, InvalidToken
-    secret = _get_secret_key()
-    if not secret or not encrypted:
-        return ''
-    try:
-        f = Fernet(_derive_fernet_key(secret))
-        return f.decrypt(encrypted.encode()).decode()
-    except (InvalidToken, Exception) as e:
-        logger.warning("Failed to decrypt API key (SECRET_KEY/POSTGRES_PASSWORD may have changed): %s", e)
-        return ''
-
-# ── External Database Support ─────────────────────────────────────────────────
-
-def _normalize_db_host(raw: str) -> str:
-    """Normalize DB_HOST: strip leading/trailing whitespace, lowercase.
-    Shared by build_conn_params() and is_external_db() to guarantee
-    the same host value is used for detection and connection."""
-    return raw.strip().lower()
-
-
-def build_conn_params() -> dict:
-    """Build PostgreSQL connection parameters from environment variables."""
-    host = _normalize_db_host(os.environ.get('DB_HOST', '127.0.0.1'))
-    params = {
-        'host': host,
-        'port': int(os.environ.get('DB_PORT', '5432')),
-        'dbname': os.environ.get('DB_NAME', 'unifi_logs'),
-        'user': os.environ.get('DB_USER', 'unifi'),
-        'password': os.environ.get('DB_PASSWORD') or os.environ.get('POSTGRES_PASSWORD', 'changeme'),
-        'connect_timeout': 10,
-        'keepalives': 1,
-        'keepalives_idle': 30,
-        'keepalives_interval': 10,
-        'keepalives_count': 3,
-    }
-    sslmode = os.environ.get('DB_SSLMODE')
-    if sslmode:
-        params['sslmode'] = sslmode
-    sslrootcert = os.environ.get('DB_SSLROOTCERT')
-    if sslrootcert:
-        params['sslrootcert'] = sslrootcert
-    sslcert = os.environ.get('DB_SSLCERT')
-    if sslcert:
-        params['sslcert'] = sslcert
-    sslkey = os.environ.get('DB_SSLKEY')
-    if sslkey:
-        params['sslkey'] = sslkey
-    return params
-
-
-def is_external_db() -> bool:
-    """Check if the app is configured to use an external database."""
-    host = _normalize_db_host(os.environ.get('DB_HOST', '127.0.0.1'))
-    return host not in ('127.0.0.1', 'localhost', 'localhost.localdomain', '::1', '')
-
-
-def wait_for_postgres(conn_params: dict, max_retries: int = 30, delay: float = 2.0):
-    """Wait for PostgreSQL to be ready. Used by both receiver and API."""
-    for i in range(max_retries):
-        try:
-            conn = psycopg2.connect(**conn_params)
-            conn.close()
-            logger.info("PostgreSQL is ready.")
-            return
-        except psycopg2.OperationalError:
-            logger.warning("Waiting for PostgreSQL... (%d/%d)", i + 1, max_retries)
-            time.sleep(delay)
-    logger.critical("PostgreSQL not available after %d retries. Check DB_HOST, DB_PORT, "
-                    "DB_USER, DB_PASSWORD, network connectivity, and firewall rules.", max_retries)
-    sys.exit(1)
-
-
-# Column names matching the logs table
-INSERT_COLUMNS = [
-    'timestamp', 'log_type', 'direction',
-    'src_ip', 'src_port', 'dst_ip', 'dst_port', 'protocol', 'service_name',
-    'rule_name', 'rule_desc', 'rule_action',
-    'interface_in', 'interface_out',
-    'mac_address', 'hostname',
-    'dns_query', 'dns_type', 'dns_answer',
-    'dhcp_event', 'wifi_event',
-    'geo_country', 'geo_city', 'geo_lat', 'geo_lon',
-    'asn_number', 'asn_name',
-    'threat_score', 'threat_categories', 'rdns',
-    'abuse_usage_type', 'abuse_hostnames',
-    'abuse_total_reports', 'abuse_last_reported',
-    'abuse_is_whitelisted', 'abuse_is_tor',
-    'src_device_name', 'dst_device_name',
-    'remote_ip',
-    'raw_log',
-]
-
-INSERT_SQL = f"""
-    INSERT INTO logs ({', '.join(INSERT_COLUMNS)})
-    VALUES ({', '.join(['%s'] * len(INSERT_COLUMNS))})
-"""
-
-
-# ── Retention configuration — parsers and result types ───────────────────────
-
-def parse_retention_time(raw) -> str | None:
-    """Parse and range-validate a retention_time input value.
-
-    Returns a canonical 'HH:MM' string in the 00:00..23:59 range, or None for
-    any non-coercible / out-of-range input. Accepts strings like '23:17',
-    '3:5', '03:05' — the return value is always zero-padded two-digit form.
-
-    Shared by Database.resolve_retention_time (for UI/env values) and the
-    route handlers in routes/setup.py (for POST bodies and import payloads).
-    Callers decide how to surface None — resolver falls through to the next
-    precedence level, POST raises HTTPException, import pushes to failed_keys.
-
-    The return value is directly consumable by `schedule.every().day.at(...)`
-    so there's no format conversion needed in the scheduler.
-    """
-    if not isinstance(raw, str):
-        return None
-    parts = raw.strip().split(':')
-    if len(parts) != 2:
-        return None
-    try:
-        hour = int(parts[0])
-        minute = int(parts[1])
-    except ValueError:
-        return None
-    if not (0 <= hour <= 23 and 0 <= minute <= 59):
-        return None
-    return f"{hour:02d}:{minute:02d}"
-
-
-class RetentionTimeConfig(NamedTuple):
-    time: str    # 'HH:MM', 00:00..23:59
-    source: str  # 'ui' | 'env' | 'default'
-
-
-RETENTION_TIME_DEFAULT = '03:00'
-
-# Module-level flag so the legacy RETENTION_TIME deprecation warning fires
-# once per process, not on every resolver call (the resolver runs on every
-# GET /api/config/retention and every SIGUSR2 scheduler rebuild).
-_legacy_retention_time_warned = False
-
-
-def parse_retention_days(raw) -> int | None:
-    """Parse and range-validate a retention-days input value.
-
-    Returns positive int or None for any non-coercible / non-positive input.
-    Accepts coercible values (including string digits) — this is for inputs
-    from untrusted sources (API bodies, env vars, DB values).
-
-    Related but distinct: `Database.validate_retention_days` is a stricter
-    post-resolution invariant check (type: must already be `int`, not just
-    coercible) used on values that have already been through a resolver.
-    Both functions exist because they run at different points in the
-    lifecycle — see that method's docstring for the scoping rule.
-    """
-    try:
-        days = int(raw)
-    except (ValueError, TypeError):
-        return None
-    return days if days > 0 else None
-
-
-class RetentionDaysConfig(NamedTuple):
-    general: int
-    general_source: str   # 'ui' | 'env' | 'default'
-    dns: int
-    dns_source: str       # 'ui' | 'env' | 'default'
+logger = _PackageLoggerProxy()
 
 
 class Database:
@@ -239,34 +65,12 @@ class Database:
 
     # Heavyweight indexes created post-boot with CONCURRENTLY for upgrades.
     # Fresh installs get these from init.sql; this list handles existing installs.
-    _POST_BOOT_INDEXES = [
-        {
-            'name': 'idx_logs_spgist_dst_ip_firewall',
-            'sql': "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_logs_spgist_dst_ip_firewall "
-                   "ON logs USING spgist (dst_ip) WHERE log_type = 'firewall'",
-            'label': 'SP-GiST dst_ip for WAN detection',
-        },
-        {
-            'name': 'idx_logs_type_id',
-            'sql': "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_logs_type_id "
-                   "ON logs (log_type, id)",
-            'label': 'type+id for purge batches',
-        },
-        {
-            'name': 'idx_logs_nondns_timestamp',
-            'sql': "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_logs_nondns_timestamp "
-                   "ON logs (timestamp DESC) WHERE log_type != 'dns'",
-            'label': 'non-DNS retention cleanup',
-        },
-    ]
+    _POST_BOOT_INDEXES = _schema.POST_BOOT_INDEXES
 
     # Redundant indexes dropped on upgrade. Each is a leftmost-prefix of an
     # existing composite so the planner loses nothing, but they incur write
     # amplification on every INSERT. DROP CONCURRENTLY IF EXISTS is idempotent.
-    _POST_BOOT_DROPS = [
-        ('idx_logs_type',        "DROP INDEX CONCURRENTLY IF EXISTS idx_logs_type"),
-        ('idx_logs_rule_action', "DROP INDEX CONCURRENTLY IF EXISTS idx_logs_rule_action"),
-    ]
+    _POST_BOOT_DROPS = _schema.POST_BOOT_DROPS
 
     def __init__(self, conn_params: dict | None = None, min_conn: int = 2, max_conn: int = 10):
         """Configure connection parameters and pool size limits."""
@@ -385,19 +189,19 @@ class Database:
             # Normalize protocol to lowercase for index optimization
             # Uses system_config marker to skip on subsequent boots (matches backfill pattern)
             """DO $$
-BEGIN
-  IF NOT EXISTS (
-    SELECT 1 FROM system_config
-    WHERE key = 'protocol_normalization_done'
-      AND value = 'true'::jsonb
-  ) THEN
-    UPDATE logs SET protocol = LOWER(protocol)
-    WHERE protocol IS NOT NULL AND protocol != LOWER(protocol);
-    INSERT INTO system_config (key, value, updated_at)
-    VALUES ('protocol_normalization_done', 'true'::jsonb, NOW())
-    ON CONFLICT (key) DO UPDATE SET value = 'true'::jsonb, updated_at = NOW();
-  END IF;
-END $$;""",
+        BEGIN
+          IF NOT EXISTS (
+            SELECT 1 FROM system_config
+            WHERE key = 'protocol_normalization_done'
+              AND value = 'true'::jsonb
+          ) THEN
+            UPDATE logs SET protocol = LOWER(protocol)
+            WHERE protocol IS NOT NULL AND protocol != LOWER(protocol);
+            INSERT INTO system_config (key, value, updated_at)
+            VALUES ('protocol_normalization_done', 'true'::jsonb, NOW())
+            ON CONFLICT (key) DO UPDATE SET value = 'true'::jsonb, updated_at = NOW();
+          END IF;
+        END $$;""",
             # Legacy MCP tables — only create if not already migrated to api_tokens
             """DO $$ BEGIN
                 IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = '_mcp_tokens_backup' AND table_schema = 'public')
@@ -737,6 +541,7 @@ END $$;""",
                 );
             END $$""",
         ]
+
         try:
             with self.get_conn() as conn:
                 with conn.cursor() as cur:
@@ -1298,7 +1103,11 @@ END $$;""",
         in main.py calls it with an arbitrary Database reference and a pure
         function is easier to test.
         """
-        global _legacy_retention_time_warned
+        # The legacy-deprecation flag lives on the ``db`` package itself so
+        # tests can flip ``db._legacy_retention_time_warned = False`` between
+        # cases (see ``receiver/tests/conftest.py``). Import lazily to avoid
+        # importing the package while it is being initialised.
+        import db as _db_pkg
 
         ui = parse_retention_time(db.get_config('retention_time'))
         if ui is not None:
@@ -1312,13 +1121,13 @@ END $$;""",
         # Legacy env var (deprecated in v3.6.3). Honour it but warn — once.
         legacy = parse_retention_time(os.environ.get('RETENTION_TIME'))
         if legacy is not None:
-            if not _legacy_retention_time_warned:
+            if not _db_pkg._legacy_retention_time_warned:
                 logger.warning(
                     "RETENTION_TIME env var is deprecated; rename to "
                     "RETENTION_CLEANUP_TIME. The fallback will be removed "
                     "in a future release."
                 )
-                _legacy_retention_time_warned = True
+                _db_pkg._legacy_retention_time_warned = True
             return RetentionTimeConfig(legacy, 'env')
 
         return RetentionTimeConfig(RETENTION_TIME_DEFAULT, 'default')
@@ -1600,7 +1409,7 @@ END $$;""",
 
     def bulk_upsert_threats(self, entries: list[tuple]) -> int:
         """Bulk upsert threat scores. entries = [(ip, score, categories), ...].
-        
+
         Uses execute_batch for efficiency. Returns number of rows upserted.
         The daily blacklist import is treated as a high-signal operator-facing
         classification. Existing multi-category check-API results are preserved,
@@ -2298,55 +2107,3 @@ END $$;""",
                     {'interface': r[0], 'event_count': int(r[1]), 'wan_ip': r[2] or ''}
                     for r in cur.fetchall()
                 ]
-
-
-# ── Standalone helper functions ───────────────────────────────────────────────
-
-def get_config(db, key: str, default=None):
-    """Standalone helper: fetch config using Database instance."""
-    return db.get_config(key, default)
-
-
-def set_config(db, key: str, value):
-    """Standalone helper: set config using Database instance."""
-    return db.set_config(key, value)
-
-
-def get_wan_ips_from_config(db) -> list[str]:
-    """Derive ordered WAN IP list from wan_ip_by_iface + wan_interfaces.
-
-    Falls back to legacy 'wan_ips' config key if 'wan_ip_by_iface' doesn't
-    exist (pre-multi-WAN installs that haven't re-run the wizard).
-    Returns list of WAN IP strings (may be empty).
-    """
-    wan_ip_by_iface = db.get_config('wan_ip_by_iface')
-    if wan_ip_by_iface:
-        wan_interfaces = db.get_config('wan_interfaces', [])
-        # Derive ordered list following wan_interfaces order
-        return [wan_ip_by_iface[iface] for iface in wan_interfaces
-                if iface in wan_ip_by_iface and wan_ip_by_iface[iface]]
-    # Legacy fallback: use wan_ips config key directly
-    return db.get_config('wan_ips') or []
-
-
-def parse_vpn_config(raw) -> dict:
-    """Parse vpn_networks config value into a dict, handling all storage forms."""
-    if not raw:
-        return {}
-    if isinstance(raw, dict):
-        return raw
-    if isinstance(raw, str):
-        try:
-            parsed = json.loads(raw)
-            return parsed if isinstance(parsed, dict) else {}
-        except (json.JSONDecodeError, ValueError):
-            return {}
-    return {}
-
-
-def count_logs(db, log_type='firewall'):
-    """Count logs by type."""
-    with db.get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*) FROM logs WHERE log_type = %s", [log_type])
-            return cur.fetchone()[0]
