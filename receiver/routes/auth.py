@@ -430,11 +430,12 @@ def get_proxy_token(request: Request):
 @router.post("/api/auth/setup")
 def auth_setup(request: Request, body: dict):
     """Create first user. Only works when no users exist."""
-    # Check if users already exist BEFORE checking HTTPS to prevent
-    # information disclosure about setup state via HTTPS error messages.
+    # Fast path — checks the common case before HTTPS enforcement to avoid
+    # info-disclosure via HTTPS error messages. The authoritative check
+    # (with advisory lock, TOCTOU-safe) runs inside the transaction below.
     if _has_users():
         raise HTTPException(400, "Setup already completed. Users already exist.")
-    
+
     # For first-admin setup, require actual HTTPS connection.
     # Defense in depth: even if proxy token leaks, attacker cannot use it
     # to bypass HTTPS for this critical operation.
@@ -455,6 +456,17 @@ def auth_setup(request: Request, body: dict):
     conn = get_conn()
     try:
         with conn.cursor() as cur:
+            # Acquire advisory lock to serialize concurrent setup attempts.
+            # Lock ID 1000001 is arbitrary but deterministic for the setup operation.
+            # This prevents TOCTOU races where multiple requests could observe an empty
+            # user table and both attempt to create admin accounts.
+            cur.execute("SELECT pg_advisory_xact_lock(1000001)")
+            
+            # Recheck user existence within the locked transaction
+            cur.execute("SELECT EXISTS(SELECT 1 FROM users WHERE is_active = true)")
+            if cur.fetchone()[0]:
+                raise HTTPException(400, "Setup already completed. Users already exist.")
+            
             # Get admin role id
             cur.execute("SELECT id FROM roles WHERE name = 'admin'")
             role_row = cur.fetchone()
@@ -462,6 +474,7 @@ def auth_setup(request: Request, body: dict):
                 raise HTTPException(500, "Admin role not found. Database migration may be incomplete.")
             role_id = role_row[0]
 
+            # Insert the first admin user
             cur.execute(
                 """INSERT INTO users (username, password_hash, role_id)
                    VALUES (%s, %s, %s) RETURNING id""",
