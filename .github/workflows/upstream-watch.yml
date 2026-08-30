@@ -1,0 +1,146 @@
+name: Upstream watch
+
+# Checks jmasarweh/UniFi-Insights-Plus (the dormant upstream) once a day and
+# opens/updates an issue when new commits appear, so we can decide whether to
+# cherry-pick any of them into our fork.
+
+on:
+  schedule:
+    - cron: '0 9 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: upstream-watch
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  check-upstream:
+    runs-on: ubuntu-latest
+    env:
+      UPSTREAM_REPO: jmasarweh/UniFi-Insights-Plus
+      UPSTREAM_BRANCH: main
+      BASELINE_FILE: .github/upstream-baseline.txt
+      SYNC_LABEL: upstream-sync
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Read baseline and fetch upstream HEAD
+        id: state
+        run: |
+          set -euo pipefail
+          baseline=$(tr -d '[:space:]' < "$BASELINE_FILE")
+          if [ -z "$baseline" ]; then
+            echo "Baseline file is empty — refusing to run" >&2
+            exit 1
+          fi
+          head=$(gh api "/repos/${UPSTREAM_REPO}/commits/${UPSTREAM_BRANCH}" --jq .sha)
+          echo "baseline=$baseline" >> "$GITHUB_OUTPUT"
+          echo "head=$head" >> "$GITHUB_OUTPUT"
+          if [ "$baseline" = "$head" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: No upstream activity
+        if: steps.state.outputs.changed == 'false'
+        run: echo "No new commits on ${UPSTREAM_REPO}@${UPSTREAM_BRANCH} (still at ${{ steps.state.outputs.head }})."
+
+      - name: Ensure sync label exists
+        if: steps.state.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          if ! gh label list --repo "$GITHUB_REPOSITORY" --limit 200 --json name --jq '.[].name' | grep -Fxq "$SYNC_LABEL"; then
+            gh label create "$SYNC_LABEL" \
+              --repo "$GITHUB_REPOSITORY" \
+              --color BFD4F2 \
+              --description "Tracks activity on the dormant jmasarweh upstream"
+          fi
+
+      - name: Build issue body
+        if: steps.state.outputs.changed == 'true'
+        id: body
+        env:
+          BASELINE: ${{ steps.state.outputs.baseline }}
+          HEAD_SHA: ${{ steps.state.outputs.head }}
+        run: |
+          set -euo pipefail
+          compare_url="https://github.com/${UPSTREAM_REPO}/compare/${BASELINE}...${HEAD_SHA}"
+
+          commits_json=$(gh api "/repos/${UPSTREAM_REPO}/compare/${BASELINE}...${HEAD_SHA}" --jq '.commits')
+          count=$(jq 'length' <<<"$commits_json")
+
+          {
+            echo "Upstream \`${UPSTREAM_REPO}@${UPSTREAM_BRANCH}\` moved from [\`${BASELINE:0:7}\`](https://github.com/${UPSTREAM_REPO}/commit/${BASELINE}) to [\`${HEAD_SHA:0:7}\`](https://github.com/${UPSTREAM_REPO}/commit/${HEAD_SHA}) — **${count} new commit(s)**."
+            echo
+            echo "Compare: ${compare_url}"
+            echo
+            echo "| SHA | Date | Author | Message |"
+            echo "| --- | --- | --- | --- |"
+            jq -r --arg repo "$UPSTREAM_REPO" '
+              .[] |
+              "| [`\(.sha[0:7])`](https://github.com/\($repo)/commit/\(.sha)) | \(.commit.author.date) | \(.commit.author.name) | \((.commit.message | split("\n")[0]) | gsub("\\|"; "\\|")) |"
+            ' <<<"$commits_json"
+            echo
+            echo "Review these to decide if any should be cherry-picked into \`main\`. Close this issue once triaged."
+            echo
+            echo "<!-- upstream-watch:baseline=${BASELINE} head=${HEAD_SHA} -->"
+          } > body.md
+
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+          {
+            echo "title=Upstream activity detected — ${count} new commit(s) on ${UPSTREAM_REPO}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Open or update tracking issue
+        if: steps.state.outputs.changed == 'true'
+        env:
+          BASELINE: ${{ steps.state.outputs.baseline }}
+          HEAD_SHA: ${{ steps.state.outputs.head }}
+          TITLE: ${{ steps.body.outputs.title }}
+        run: |
+          set -euo pipefail
+          existing=$(gh issue list \
+            --repo "$GITHUB_REPOSITORY" \
+            --state open \
+            --label "$SYNC_LABEL" \
+            --search "\"upstream-watch:baseline=${BASELINE}\" in:body" \
+            --json number \
+            --jq '.[0].number // empty')
+
+          if [ -n "$existing" ]; then
+            echo "Updating existing tracking issue #$existing"
+            gh issue edit "$existing" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$TITLE" \
+              --body-file body.md
+          else
+            echo "Opening new tracking issue"
+            gh issue create \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$TITLE" \
+              --label "$SYNC_LABEL" \
+              --body-file body.md
+          fi
+
+      - name: Update baseline file
+        if: steps.state.outputs.changed == 'true'
+        env:
+          HEAD_SHA: ${{ steps.state.outputs.head }}
+        run: |
+          set -euo pipefail
+          echo "$HEAD_SHA" > "$BASELINE_FILE"
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add "$BASELINE_FILE"
+          if git diff --cached --quiet; then
+            echo "Baseline unchanged, nothing to commit"
+          else
+            git commit -m "chore(ci): bump upstream-watch baseline to ${HEAD_SHA:0:7}"
+            git push
+          fi
