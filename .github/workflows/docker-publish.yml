@@ -15,7 +15,7 @@ env:
   IMAGE_NAME: leto1210/unifi-log-insights
 
 permissions:
-  contents: read
+  contents: write   # needed to create the GitHub Release
   packages: write
 
 jobs:
@@ -50,6 +50,29 @@ jobs:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Ensure GitHub Release exists
+        # Idempotent: creates the Release with GitHub-generated notes on first run
+        # for this tag; is a no-op on any subsequent workflow_dispatch replay.
+        # Marks pre-release for -beta.N tags. Runs before "Fetch release notes"
+        # so that step (which feeds notes into the OCI image label) has something
+        # to read, keeping the two artifacts (image + release) in sync.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ steps.tag.outputs.name }}
+        run: |
+          if gh release view "$TAG_NAME" >/dev/null 2>&1; then
+            echo "Release $TAG_NAME already exists — skipping create"
+            exit 0
+          fi
+          PRERELEASE_FLAG=""
+          case "$TAG_NAME" in
+            *-beta.*) PRERELEASE_FLAG="--prerelease" ;;
+          esac
+          gh release create "$TAG_NAME" \
+            --title "$TAG_NAME" \
+            --generate-notes \
+            $PRERELEASE_FLAG
 
       - name: Fetch release notes
         id: release
