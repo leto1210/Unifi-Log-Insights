@@ -28,6 +28,7 @@ from backfill import BackfillTask
 from blacklist import BlacklistFetcher
 from unifi_api import UniFiAPI
 from pihole_api import PiHolePoller
+from adguard_poller import AdGuardHomePoller
 from routes.auth import auth_cleanup
 
 # Set by the SIGUSR2 handler when retention_time may have changed.
@@ -489,11 +490,15 @@ def main():
     # Start receiver
     receiver = SyslogReceiver(db, enricher)
 
+    # Initialize AdGuard Home poller (self-disables when not configured)
+    adguard_poller = AdGuardHomePoller(db)
+
     # Handle graceful shutdown
     def shutdown(signum, frame):
         """Handle SIGTERM/SIGINT: flush pending logs and exit cleanly."""
         logger.info("Received signal %d, shutting down...", signum)
         receiver.stop()
+        adguard_poller.stop()
         unifi_api.stop_polling()
         pihole.stop_polling()
         enricher.close()
@@ -514,6 +519,7 @@ def main():
         unifi_api.reload_config()
         pihole.reload_config()
         enricher.reload_config()
+        adguard_poller.reload_config()
         receiver._load_disabled_types()
         # scheduler thread will rebuild the retention job on its next tick
         _retention_reload_requested.set()
@@ -547,11 +553,15 @@ def main():
     # Start Pi-hole polling (only runs if enabled)
     pihole.start_polling()
 
+    # Start AdGuard Home query log poller (only polls when enabled + configured)
+    adguard_poller.start()
+
     # Start receiving (blocks)
     try:
         receiver.start()
     except KeyboardInterrupt:
         receiver.stop()
+        adguard_poller.stop()
         unifi_api.stop_polling()
         pihole.stop_polling()
         enricher.close()

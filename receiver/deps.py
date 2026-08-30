@@ -95,7 +95,7 @@ def put_conn(conn):
 
 # ── AbuseIPDB Enricher (for manual enrich endpoint) ─────────────────────────
 
-enricher_db = Database(conn_params, min_conn=2, max_conn=8)
+enricher_db = Database(conn_params, min_conn=2, max_conn=10)
 enricher_db.connect()
 abuseipdb = AbuseIPDBEnricher(db=enricher_db)
 
@@ -152,13 +152,37 @@ def get_config_source(db, key: str, env_map: dict, db_prefix: str) -> str:
     return 'default'
 
 
-def signal_receiver():
-    """Signal the receiver process to reload config."""
-    try:
-        subprocess.run(['pkill', '-SIGUSR2', '-f', '/app/main.py'],
-                      check=False, timeout=2)
-        with open('/tmp/config_update_requested', 'w') as f:
+def signal_receiver() -> bool:
+    """Signal the receiver process to reload config.
+
+    Returns True if the SIGUSR2 was delivered (pkill found a matching
+    process), False if no process was found or an exception occurred.
+    Callers should log a warning on False; the config is always committed
+    to the DB before this call so a failed signal is not data loss.
+    """
+    def _write_reload_marker() -> None:
+        marker_path = '/tmp/config_update_requested'
+        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+        if hasattr(os, 'O_NOFOLLOW'):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(marker_path, flags, 0o600)
+        with os.fdopen(fd, 'w') as f:
             f.write(str(time.time()))
-        logger.info("Signaled receiver process to reload config")
+
+    try:
+        result = subprocess.run(['pkill', '-SIGUSR2', '-f', '/app/main.py'],
+                                check=False, timeout=2)
+        signaled = result.returncode == 0
+        _write_reload_marker()
+        if signaled:
+            logger.info("Signaled receiver process to reload config")
+        else:
+            logger.warning(
+                "signal_receiver: pkill found no matching process (exit %d) "
+                "-- config saved but reload requires a service restart",
+                result.returncode,
+            )
+        return signaled
     except Exception as e:
         logger.warning("Failed to signal receiver: %s", e)
+        return False
