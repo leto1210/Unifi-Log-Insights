@@ -912,13 +912,22 @@ class UniFiAPI:
         retried = 0
         errors = []
 
-        # Filter out items with no loggingEnabled value
+        # Filter out items with no loggingEnabled value OR no id. Without the
+        # id filter, a single malformed row would raise KeyError inside the
+        # thread-pool submit comprehension and abort the whole batch — losing
+        # every other policy's update. Better: skip the bad row, log it, keep
+        # processing the good ones.
         work_items = []
         for item in updates:
             if item.get('loggingEnabled') is None:
                 skipped += 1
-            else:
-                work_items.append(item)
+                continue
+            if not item.get('id'):
+                logger.warning("Bulk patch: skipping item with no id: %r", item)
+                failed += 1
+                errors.append({'id': None, 'error': 'missing policy id in payload'})
+                continue
+            work_items.append(item)
 
         work_total = len(work_items)
 
