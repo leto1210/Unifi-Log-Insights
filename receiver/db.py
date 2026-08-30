@@ -622,6 +622,19 @@ END $$;""",
             END $$""",
             # Auth: migration version marker
             """INSERT INTO system_config (key, value, updated_at) VALUES ('mcp_migration_version', '1'::jsonb, NOW()) ON CONFLICT (key) DO NOTHING""",
+            # Auth: disable ownerless tokens created during setup mode (security fix)
+            # Ownerless tokens bypass owner-role permission intersection and receive
+            # their raw embedded scopes. Tokens created before authentication was
+            # enabled must be disabled to prevent privilege escalation.
+            """DO $$ BEGIN
+                IF NOT EXISTS (SELECT 1 FROM system_config WHERE key = 'ownerless_tokens_disabled' AND value = 'true'::jsonb) THEN
+                    UPDATE api_tokens SET disabled = true
+                    WHERE owner_user_id IS NULL AND disabled = false;
+                    INSERT INTO system_config (key, value, updated_at)
+                    VALUES ('ownerless_tokens_disabled', 'true'::jsonb, NOW())
+                    ON CONFLICT (key) DO UPDATE SET value = 'true'::jsonb, updated_at = NOW();
+                END IF;
+            END $$""",
             # ── Issue #67: queue-driven backfill (replaces sweep model) ────
             # 1. Queue for deferred threat enrichment
             """CREATE TABLE IF NOT EXISTS threat_backfill_queue (

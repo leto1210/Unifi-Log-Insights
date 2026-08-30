@@ -308,13 +308,25 @@ def validate_token_with_effective_scopes(token: str) -> dict | None:
     """Validate an API token and return context with effective scopes.
 
     Effective scopes = token scopes ∩ owner's role permissions.
-    Ownerless tokens or admin wildcard use token scopes alone.
+    Ownerless tokens created during setup mode are rejected when authentication
+    is enabled to prevent privilege escalation from pre-auth token minting.
+    Admin wildcard permissions use token scopes alone.
     Returns dict with: token_id, owner_user_id, username, role_name,
     scopes (raw), effective_scopes, client_type. Or None if invalid.
     """
     info = _validate_api_token(token)
     if not info:
         return None
+    
+    # Reject ownerless tokens when authentication is enabled to prevent
+    # setup-mode tokens from bypassing authentication after it's enabled
+    if info.get('owner_user_id') is None and _auth_enabled():
+        logger.warning(
+            "Rejected ownerless token %s created during setup mode (auth now enabled)",
+            info.get('token_id', 'unknown')
+        )
+        return None
+    
     token_scopes = set(info.get('scopes') or [])
     owner_perms = set(info.get('user_permissions') or [])
     if info.get('owner_user_id') and owner_perms and '*' not in owner_perms:

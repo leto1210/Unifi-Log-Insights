@@ -135,14 +135,18 @@ def _require_session_admin(request: Request) -> dict:
     Bearer tokens are already rejected by AuthMiddleware for /api/tokens paths.
     Auth is already enforced by middleware; this reads request.state.auth_info.
 
-    When auth is disabled (single-user mode), returns an empty dict. Downstream
-    callers (e.g. audit) will get None from .get('user_id') — this is expected
-    since there is no authenticated user identity in no-auth mode.
+    Token creation is blocked when authentication is disabled to prevent
+    unauthenticated callers from minting persistent privileged tokens that
+    would remain valid after authentication is enabled.
     """
     auth_info = getattr(request.state, 'auth_info', None)
     if auth_info is None:
-        # Auth disabled — allow (single-user mode, no identity to attribute)
-        return {}
+        # Auth disabled — reject token operations to prevent setup-mode token minting
+        raise HTTPException(
+            403,
+            "Token management requires authentication. Enable authentication "
+            "and create an admin user before managing API tokens."
+        )
 
     if not auth_info.get('user_id'):
         raise HTTPException(401, "Session authentication required")
