@@ -4,7 +4,12 @@ Welcome to the UniFi Log Insight wiki. These guides cover advanced topics beyond
 
 ## Guides
 
+- [Getting Started](Getting-Started) — 5-minute walkthrough from a fresh Docker host to logs flowing.
+- [Configuration Reference](Configuration) — every environment variable, safe defaults, when to change what.
+- [MCP Server](MCP) — expose your network data to Claude Desktop / Claude Code / any MCP client, with the full tool catalog.
+- [Troubleshooting](Troubleshooting) — common failures with the exact log signature and the fix.
 - [External PostgreSQL Migration Guide](External-PostgreSQL-Migration-Guide) — Migrate from the embedded database to an external PostgreSQL server, with Docker networking guidance and a step-by-step walkthrough of the in-app migration wizard.
+- [Architecture](architecture) — how the three-process container fits together, data flow, DB schema highlights.
 
 ## Quick Links
 
