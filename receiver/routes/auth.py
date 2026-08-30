@@ -21,30 +21,145 @@ router = APIRouter()
 # ── Proxy Trust (shared-secret header) ────────────────────────────────────────
 #
 # Trust of X-Forwarded-Proto / X-Forwarded-For is gated by a shared secret.
-# The app derives a deterministic token from SECRET_KEY, POSTGRES_PASSWORD,
-# or DB_PASSWORD (first non-empty wins).
+# The app generates a cryptographically random token on first startup and persists
+# it in the database. This prevents predictable token derivation from weak or
+# default deployment credentials.
 # The reverse proxy must send this token in the X-ULI-Proxy-Auth header.
 # No IP/subnet configuration needed.
 
-def _derive_proxy_token() -> str:
-    """Derive a deterministic proxy-auth token from the app secret."""
-    # @coderabbit: Fallback chain is intentional — SECRET_KEY is preferred, but
-    # internal-DB users have POSTGRES_PASSWORD and external-DB users have DB_PASSWORD.
-    # HMAC domain separation ('proxy-auth') prevents reuse as a DB credential.
-    # Empty-string fallback is safe: POSTGRES_PASSWORD is always set (required by
-    # PostgreSQL) for internal-DB, and DB_PASSWORD is required for external-DB.
-    # The only scenario where all three are unset is a broken deployment that
-    # can't connect to any database anyway — no HTTP traffic to protect.
-    secret = (os.environ.get('SECRET_KEY')
-              or os.environ.get('POSTGRES_PASSWORD')
-              or os.environ.get('DB_PASSWORD', ''))
-    return _hmac.new(secret.encode(), b'proxy-auth', hashlib.sha256).hexdigest()
+def _validate_deployment_secrets() -> tuple[bool, list[str]]:
+    """Validate deployment secrets for minimum security requirements.
+    
+    Returns (is_valid, warnings) where warnings contains human-readable messages
+    about weak or missing secrets.
+    """
+    warnings = []
+    
+    # Check for completely missing secrets
+    secret_key = os.environ.get('SECRET_KEY', '').strip()
+    postgres_password = os.environ.get('POSTGRES_PASSWORD', '').strip()
+    db_password = os.environ.get('DB_PASSWORD', '').strip()
+    
+    has_any_secret = bool(secret_key or postgres_password or db_password)
+    
+    if not has_any_secret:
+        warnings.append("CRITICAL: No SECRET_KEY, POSTGRES_PASSWORD, or DB_PASSWORD set. "
+                       "API key encryption and database connection will fail.")
+        return False, warnings
+    
+    # Check for default/placeholder values that should never be used in production
+    default_patterns = [
+        'changeme',
+        'your_strong_key',
+        'your_strong_password',
+        'your_key_here',
+        'your_password_here',
+        'placeholder',
+        'example',
+        'test',
+        'password',
+        '123456',
+    ]
+    
+    for secret_name, secret_value in [
+        ('SECRET_KEY', secret_key),
+        ('POSTGRES_PASSWORD', postgres_password),
+        ('DB_PASSWORD', db_password)
+    ]:
+        if not secret_value:
+            continue
+        
+        # Check length
+        if len(secret_value) < 16:
+            warnings.append(f"WARNING: {secret_name} is too short (minimum 16 characters recommended)")
+        
+        # Check for default patterns
+        lower_value = secret_value.lower()
+        for pattern in default_patterns:
+            if pattern in lower_value:
+                warnings.append(f"CRITICAL: {secret_name} contains default/placeholder value '{pattern}'. "
+                              f"This is a severe security risk.")
+                return False, warnings
+    
+    return True, warnings
 
-PROXY_AUTH_TOKEN = _derive_proxy_token()
+
+def _generate_or_retrieve_proxy_token() -> str:
+    """Generate a random proxy token on first startup, or retrieve existing one.
+    
+    The token is stored in system_config and persists across restarts.
+    This prevents predictable token derivation from weak deployment credentials.
+    """
+    from db import get_config, set_config
+    from deps import enricher_db
+    
+    # Try to retrieve existing token
+    try:
+        existing_token = get_config(enricher_db, 'proxy_auth_token', None)
+        if existing_token and isinstance(existing_token, str) and len(existing_token) == 64:
+            # Valid existing token (64 hex chars = 32 bytes)
+            return existing_token
+    except Exception as e:
+        logger.warning("Failed to retrieve proxy auth token from database: %s", e)
+    
+    # Generate new random token (32 bytes = 64 hex characters)
+    new_token = secrets.token_hex(32)
+    
+    # Persist to database
+    try:
+        set_config(enricher_db, 'proxy_auth_token', new_token)
+        logger.info("Generated new random proxy auth token and persisted to database")
+    except Exception as e:
+        logger.error("Failed to persist proxy auth token to database: %s", e)
+        # Continue with the generated token - it will be regenerated on next restart
+        # but at least this instance will work
+    
+    return new_token
+
+
+# Validate deployment secrets at module load time
+_secrets_valid, _secret_warnings = _validate_deployment_secrets()
+
+# Generate or retrieve the proxy auth token
+# This must happen after database initialization, so we defer it
+PROXY_AUTH_TOKEN = None  # Will be initialized by init_proxy_token()
+
+
+def init_proxy_token() -> None:
+    """Initialize the proxy auth token. Must be called after database is ready."""
+    global PROXY_AUTH_TOKEN
+    if PROXY_AUTH_TOKEN is not None:
+        return  # Already initialized
+    
+    # Log any secret validation warnings. CodeQL flags these as clear-text
+    # logging of sensitive data (taint analysis) — false positive: the warning
+    # strings only contain the secret's NAME (e.g. "SECRET_KEY") and the
+    # matched default-pattern NAME (e.g. "changeme"), never the actual value.
+    # See _validate_deployment_secrets() above for the construction.
+    if _secret_warnings:
+        for warning in _secret_warnings:
+            if warning.startswith('CRITICAL:'):
+                logger.critical(warning)  # lgtm[py/clear-text-logging-sensitive-data]
+            else:
+                logger.warning(warning)  # lgtm[py/clear-text-logging-sensitive-data]
+    
+    # Fail closed if secrets are invalid
+    if not _secrets_valid:
+        logger.critical("Deployment secrets validation failed. Application cannot start securely.")
+        logger.critical("Please set strong, random values for SECRET_KEY, POSTGRES_PASSWORD, and/or DB_PASSWORD.")
+        import sys
+        sys.exit(1)
+    
+    # Generate or retrieve token
+    PROXY_AUTH_TOKEN = _generate_or_retrieve_proxy_token()
 
 
 def log_proxy_token() -> None:
-    """Log the proxy auth token prefix for verification.  Must be called after logging.basicConfig()."""
+    """Log the proxy auth token prefix for verification. Must be called after
+    logging.basicConfig() and init_proxy_token()."""
+    if PROXY_AUTH_TOKEN is None:
+        logger.error("Proxy auth token not initialized - call init_proxy_token() first")
+        return
     # Only log a prefix to prevent credential disclosure in logs while still
     # allowing operators to verify the token is being derived correctly.
     # Full token retrieval requires authenticated admin access to /api/auth/proxy-token.
@@ -57,6 +172,9 @@ def log_proxy_token() -> None:
 
 def _is_trusted_proxy(request: Request) -> bool:
     """Check if the request carries a valid X-ULI-Proxy-Auth header."""
+    if PROXY_AUTH_TOKEN is None:
+        # Token not initialized - fail closed
+        return False
     header = request.headers.get('x-uli-proxy-auth')
     if not header:
         return False
@@ -402,7 +520,7 @@ def auth_status(request: Request):
         "setup_complete": setup_result.get('setup_complete', False),
         "session_ttl_hours": int(get_config(enricher_db, 'auth_session_ttl_hours', 168) or 168),
     }
-    # Never expose the proxy token via unauthenticated endpoints.
+    # Never expose the proxy token via unauthenticated endpoints (per PR #18).
     # The token is a bearer credential that can bypass HTTPS requirements and
     # spoof client IPs. Operators must retrieve it via the authenticated
     # /api/auth/proxy-token endpoint (admin session required).
@@ -421,6 +539,8 @@ def get_proxy_token(request: Request):
         raise HTTPException(403, "Session auth required — API tokens cannot retrieve proxy secret")
     if info.get('role_name') != 'admin':
         raise HTTPException(403, "Admin access required")
+    if PROXY_AUTH_TOKEN is None:
+        raise HTTPException(500, "Proxy auth token not initialized")
     return {
         "token": PROXY_AUTH_TOKEN,
         "header_name": "X-ULI-Proxy-Auth",
