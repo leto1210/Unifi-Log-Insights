@@ -64,7 +64,12 @@ class SyslogReceiver:
         actual_rcvbuf = self.sock.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
         logger.info("UDP socket SO_RCVBUF: requested=1048576, actual=%d", actual_rcvbuf)
 
-        self.sock.bind(('::', SYSLOG_PORT))
+        # Bind to all interfaces — syslog receivers must accept traffic from any
+        # network the container is attached to (bridge, host, macvlan, LAN).
+        # Access control is enforced at the Docker/host firewall boundary, not
+        # here. See docker-compose.yml `ports: "514:514/udp"` which already
+        # narrows exposure at the daemon level.
+        self.sock.bind(('::', SYSLOG_PORT))  # noqa: S104  # lgtm[py/bind-socket-all-network-interfaces]
         self.sock.settimeout(1.0)  # Allow periodic batch flushing
         self.running = True
 
