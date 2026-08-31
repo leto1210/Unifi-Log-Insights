@@ -74,6 +74,11 @@ fi  # end external_db else block
 
 echo "[entrypoint] Starting services via supervisord..."
 
+# Re-assert ownership on paths the unprivileged 'uli' user must write to.
+# Needed whenever a host bind mount (./maxmind:/app/maxmind, log dirs) lands
+# with a UID other than 1000; without this, receiver/cron would get EACCES.
+chown -R uli:uli /app/maxmind /var/log/geoip-update.log 2>/dev/null || true
+
 # Configure MaxMind GeoIP auto-update if credentials are provided
 if [ -n "$MAXMIND_ACCOUNT_ID" ] && [ -n "$MAXMIND_LICENSE_KEY" ]; then
     echo "[entrypoint] Configuring MaxMind GeoIP auto-update..."
@@ -84,8 +89,10 @@ EditionIDs GeoLite2-City GeoLite2-ASN
 DatabaseDirectory /app/maxmind
 GEOEOF
 
-    # Schedule: Wednesday 07:00 UTC and Saturday 07:00 UTC
-    echo "0 7 * * 3,6 /app/geoip-update.sh >> /var/log/geoip-update.log 2>&1" > /etc/cron.d/geoipupdate
+    # Schedule: Wednesday 07:00 UTC and Saturday 07:00 UTC.
+    # /etc/cron.d/ entries require a user field (5th column); the job runs as
+    # 'uli' so the receiver (also uli) can be signalled with kill -USR1.
+    echo "0 7 * * 3,6 uli /app/geoip-update.sh >> /var/log/geoip-update.log 2>&1" > /etc/cron.d/geoipupdate
     chmod 0644 /etc/cron.d/geoipupdate
 
     # Run an initial update if databases are missing

@@ -1,8 +1,8 @@
 ## Stage 1: Build React UI
 FROM node:20-slim AS ui-builder
 WORKDIR /ui
-COPY ui/package.json ui/package-lock.json* ./
-RUN npm install
+COPY ui/package.json ui/package-lock.json ./
+RUN npm ci
 COPY ui/ ./
 RUN npm run build
 
@@ -21,6 +21,8 @@ ENV PYTHONUNBUFFERED=1
 ENV PGDATA=/var/lib/postgresql/data
 
 # Install PostgreSQL 16 + Python 3 + supervisor + cron
+# libcap2-bin provides setcap, used to grant CAP_NET_BIND_SERVICE to the
+# receiver's python so it can bind UDP 514 without running as root.
 RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
     postgresql-16 \
     postgresql-client-16 \
@@ -30,6 +32,7 @@ RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-reco
     supervisor \
     cron \
     tzdata \
+    libcap2-bin \
     && rm -rf /var/lib/apt/lists/*
 
 # Install geoipupdate from MaxMind
@@ -42,8 +45,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
     && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/*
 
-# Create Python venv to avoid system package conflicts
-RUN python3 -m venv /app/venv
+# Create Python venv to avoid system package conflicts.
+# --copies (instead of the default symlinks) puts a real python binary inside
+# the venv, so setcap can be applied specifically to it without touching the
+# host-wide /usr/bin/python3.
+RUN python3 -m venv --copies /app/venv
 ENV PATH="/app/venv/bin:$PATH"
 
 # Install Python dependencies then remove pip (not needed at runtime)
@@ -66,6 +72,23 @@ RUN chmod +x /app/entrypoint.sh /app/geoip-update.sh
 
 # Copy built UI
 COPY --from=ui-builder /ui/dist /app/static
+
+# Create unprivileged runtime user for receiver + api (+ cron jobs).
+# Fixed UID/GID 1000 keeps ownership stable across rebuilds and host bind mounts.
+# Grant CAP_NET_BIND_SERVICE to the venv python so the receiver can bind
+# UDP 514 (a privileged port) without needing root at runtime.
+# GeoIP databases and the update log must be writable by uli (receiver reloads
+# them on SIGUSR1; the cron job writes them).
+# Ubuntu 24.04 ships a default 'ubuntu' user at UID/GID 1000; remove it so
+# 'uli' can claim that slot (the value host bind mounts most often use).
+RUN userdel -r ubuntu 2>/dev/null || true \
+    && groupadd -g 1000 uli \
+    && useradd -u 1000 -g 1000 -m -s /usr/sbin/nologin uli \
+    && mkdir -p /app/maxmind \
+    && chown -R uli:uli /app \
+    && touch /var/log/geoip-update.log \
+    && chown uli:uli /var/log/geoip-update.log \
+    && setcap 'cap_net_bind_service=+ep' "$(readlink -f /app/venv/bin/python3)"
 
 WORKDIR /app
 
