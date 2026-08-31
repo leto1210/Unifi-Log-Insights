@@ -79,6 +79,16 @@ echo "[entrypoint] Starting services via supervisord..."
 # with a UID other than 1000; without this, receiver/cron would get EACCES.
 chown -R uli:uli /app/maxmind /var/log/geoip-update.log 2>/dev/null || true
 
+# If the operator mounted TLS materials for external Postgres at /certs
+# (DB_SSLCERT / DB_SSLKEY / DB_SSLROOTCERT), libpq must be able to read them
+# as uli. Bind mounts often land as root-owned+600, which would deny uli.
+# Re-chown to uli-only (0600 preserved) so the key stays confidential to the
+# runtime user. Set SKIP_CERTS_CHOWN=1 to opt out if you manage ownership
+# yourself on the host side.
+if [ -d /certs ] && [ "${SKIP_CERTS_CHOWN:-0}" != "1" ]; then
+    chown -R uli:uli /certs 2>/dev/null || echo "[entrypoint] warning: could not chown /certs; external-DB mTLS keys may be unreadable by uli"
+fi
+
 # Configure MaxMind GeoIP auto-update if credentials are provided
 if [ -n "$MAXMIND_ACCOUNT_ID" ] && [ -n "$MAXMIND_LICENSE_KEY" ]; then
     echo "[entrypoint] Configuring MaxMind GeoIP auto-update..."
