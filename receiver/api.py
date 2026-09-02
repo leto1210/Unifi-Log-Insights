@@ -35,7 +35,7 @@ from routes.auth import (
     router as auth_router, require_auth,
     get_forwarded_proto, get_real_client_ip, _auth_enabled,
     AUTH_SESSION_PATHS, PUBLIC_PATHS, PUBLIC_PREFIXES,
-    log_proxy_token,
+    log_proxy_token, init_proxy_token,
 )
 from routes.tokens import router as tokens_router
 from routes.adguard import router as adguard_router
@@ -256,6 +256,7 @@ class _QuietAccessFilter(logging.Filter):
 @app.on_event("startup")
 def _configure_access_logging():
     logging.getLogger("uvicorn.access").addFilter(_QuietAccessFilter())
+    init_proxy_token()  # Initialize token before logging it
     log_proxy_token()
 
 

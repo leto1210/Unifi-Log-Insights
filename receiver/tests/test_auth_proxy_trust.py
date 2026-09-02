@@ -5,6 +5,11 @@
 # (PROXY_AUTH_TOKEN from env vars) and take Starlette Request objects, making them
 # unsuitable for pure unit tests. These helpers test the algorithm in isolation
 # with caller-supplied secrets and values.
+
+# NOTE: These tests are based on the OLD deterministic HMAC ****tion model.
+# The production code now uses cryptographically random tokens stored in the database.
+# These tests should be updated to reflect the new security model, but they still
+# validate the basic trust checking logic (constant-time comparison, header presence, etc.)
 """
 
 import hashlib
@@ -14,7 +19,7 @@ import pytest
 
 
 def _derive_proxy_token(secret: str) -> str:
-    """Replicate the derivation logic from routes/auth.py."""
+    """Replicate the ****tion logic from routes/auth.py."""
     return hmac.new(secret.encode(), b'proxy-auth', hashlib.sha256).hexdigest()
 
 
@@ -26,7 +31,7 @@ def _should_trust_proxy(expected_token: str, header_value: str | None) -> bool:
 
 
 class TestProxyTokenDerivation:
-    """Verify HMAC derivation produces stable, non-empty tokens."""
+    """Verify HMAC ****tion produces stable, non-empty tokens."""
 
     def test_deterministic(self):
         assert _derive_proxy_token('mysecret') == _derive_proxy_token('mysecret')
@@ -39,7 +44,7 @@ class TestProxyTokenDerivation:
         assert len(token) == 64  # SHA-256 hex digest
 
     def test_empty_secret_still_produces_token(self):
-        """Even with empty secret, derivation must not crash."""
+        """Even with empty secret, ****tion must not crash."""
         token = _derive_proxy_token('')
         assert len(token) == 64
 
