@@ -8,7 +8,7 @@ import threading
 
 import psycopg2
 import yaml
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
 from db import is_external_db
@@ -43,6 +43,30 @@ def _update_state(**kwargs):
     """Thread-safely update the shared migration state dict."""
     with _migration_lock:
         _migration_state.update(kwargs)
+
+
+def _require_migration_auth(request: Request) -> dict:
+    """Require authentication for migration endpoints.
+    
+    Migration operations are privileged server-side actions that export the
+    application database. They must never be accessible without authentication,
+    even when AUTH_ENABLED is false.
+    
+    Raises 401 if auth is disabled or no valid credentials are present.
+    Returns auth_info dict if authenticated.
+    """
+    auth_info = getattr(request.state, 'auth_info', None)
+    if auth_info is None:
+        # Auth is disabled globally — migration endpoints require it anyway
+        raise HTTPException(
+            401,
+            "Migration endpoints require authentication. Set AUTH_ENABLED=true "
+            "and configure user accounts before using database migration features."
+        )
+    
+    # Auth is enabled and middleware has validated credentials
+    # Additional role checks are handled by middleware scope enforcement
+    return auth_info
 
 
 # ── Request model ────────────────────────────────────────────────────────────
@@ -131,8 +155,9 @@ def _host_connectivity_hint(host: str, port: int) -> str:
 # ── Endpoints ────────────────────────────────────────────────────────────────
 
 @router.post("/api/migration/test-connection")
-def test_connection(params: MigrationParams):
+def test_connection(request: Request, params: MigrationParams):
     """Test connectivity and version compatibility of the target PostgreSQL database."""
+    _require_migration_auth(request)
     _validate_target(params)
     cp = _connect_params(params)
     try:
@@ -176,8 +201,9 @@ def test_connection(params: MigrationParams):
 
 
 @router.post("/api/migration/start")
-def start_migration(params: MigrationParams):
+def start_migration(request: Request, params: MigrationParams):
     """Start an async data migration to the specified external PostgreSQL database."""
+    _require_migration_auth(request)
     _validate_target(params)
     with _migration_lock:
         if _migration_state['status'] == 'running':
@@ -195,8 +221,9 @@ def start_migration(params: MigrationParams):
 
 
 @router.get("/api/migration/status")
-def migration_status():
+def migration_status(request: Request):
     """Return the current migration state (running/complete/failed) and progress."""
+    _require_migration_auth(request)
     with _migration_lock:
         state = dict(_migration_state)
     state['is_external'] = is_external_db()
@@ -204,8 +231,9 @@ def migration_status():
 
 
 @router.get("/api/migration/check-env")
-def check_env():
+def check_env(request: Request):
     """Check if DB_PASSWORD and SECRET_KEY/POSTGRES_PASSWORD are set."""
+    _require_migration_auth(request)
     has_db_password = bool(os.environ.get('DB_PASSWORD', '').strip())
     has_secret_key = bool(
         os.environ.get('SECRET_KEY', '').strip()
@@ -215,8 +243,9 @@ def check_env():
 
 
 @router.post("/api/migration/patch-compose")
-def patch_compose(req: PatchComposeRequest):
+def patch_compose(request: Request, req: PatchComposeRequest):
     """Parse user's docker-compose.yml and patch DB-related keys."""
+    _require_migration_auth(request)
     # Parse YAML
     try:
         data = yaml.safe_load(req.compose_yaml)
