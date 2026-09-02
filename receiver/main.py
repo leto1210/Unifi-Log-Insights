@@ -8,57 +8,39 @@ Phase 1: Receive → Parse → Store
 Phase 2 will add: IP enrichment (GeoIP, AbuseIPDB, rDNS)
 """
 
-import os
-import sys
-import time
-import socket
-import signal
 import logging
+import os
+import signal
+import sys
 import threading
-from collections import deque
 
-import schedule
-import psycopg2
-
-from parsers import parse_log
 import parsers
-from db import Database, get_config, set_config, build_conn_params, is_external_db, wait_for_postgres
+from db import Database, build_conn_params, get_config, is_external_db, set_config, wait_for_postgres
 from enrichment import Enricher
 from backfill import BackfillTask
 from blacklist import BlacklistFetcher
 from unifi_api import UniFiAPI
 from pihole_api import PiHolePoller
 from adguard_poller import AdGuardHomePoller
-from routes.auth import auth_cleanup
 
-# Set by the SIGUSR2 handler when retention_time may have changed.
-# Consumed by the scheduler loop (single-writer, single-reader — safe).
-# All `schedule` registry mutation stays on the scheduler thread.
-_retention_reload_requested = threading.Event()
-
-# ── Configuration ──────────────────────────────────────────────────────────────
-
-SYSLOG_PORT = 514
-SYSLOG_BUFFER_SIZE = 8192      # Max UDP packet size
-BATCH_SIZE = 50                 # Insert logs in batches
-BATCH_TIMEOUT = 2.0             # Flush batch after N seconds even if not full
-STATS_INTERVAL_MINUTES = 15     # Log stats every N minutes
-RETENTION_INTERVAL_HOURS = 12   # Run retention cleanup every N hours
-
-
-def _env_int(name: str, default: int) -> int:
-    """Read an integer env var with safe fallback."""
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    try:
-        value = int(raw)
-        return value if value > 0 else default
-    except ValueError:
-        return default
-
-
-WAN_REFRESH_INTERVAL_MINUTES = _env_int('WAN_REFRESH_INTERVAL_MINUTES', 360)
+from service.syslog_receiver import SyslogReceiver
+from service.scheduler import (
+    _register_retention_job,
+    _retention_cleanup,
+    _retention_reload_requested,
+    _scheduler_tick,
+    run_scheduler,
+)
+from service.network_identity import (
+    _log_periodic_stats,
+    _refresh_network_identity_from_logs,
+    _use_log_identity_detection,
+)
+from service.signals import (
+    make_reload_config_handler,
+    make_reload_geoip_handler,
+    make_shutdown_handler,
+)
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 
@@ -75,351 +57,19 @@ logging.basicConfig(
 logger = logging.getLogger('receiver')
 
 
-# ── Syslog Receiver ───────────────────────────────────────────────────────────
+__all__ = [
+    'SyslogReceiver',
+    '_register_retention_job',
+    '_retention_cleanup',
+    '_retention_reload_requested',
+    '_scheduler_tick',
+    'run_scheduler',
+    '_log_periodic_stats',
+    '_refresh_network_identity_from_logs',
+    '_use_log_identity_detection',
+    'main',
+]
 
-class SyslogReceiver:
-    """UDP syslog receiver with batched database writes."""
-
-    HEARTBEAT_INTERVAL = 60  # Log heartbeat every 60 seconds
-
-    def __init__(self, db: Database, enricher: Enricher):
-        """Create the receiver — does not open the socket until start() is called."""
-        self.db = db
-        self.enricher = enricher
-        self.sock = None
-        self.running = False
-        self.batch: list[dict] = []
-        self.batch_lock = threading.Lock()
-        self.last_flush = time.time()
-        self.last_heartbeat = time.time()
-        self.last_receive_time = 0.0  # Track when we last received any packet
-        self.consecutive_flush_errors = 0
-        self.stats = {
-            'received': 0,
-            'parsed': 0,
-            'filtered': 0,
-            'failed': 0,
-            'inserted': 0,
-            'flush_errors': 0,
-            'dropped': 0,
-        }
-        self._load_disabled_types()
-
-    def _load_disabled_types(self):
-        """Load set of log types that should be silently discarded."""
-        disabled = set()
-        if not get_config(self.db, 'wifi_processing_enabled', True):
-            disabled.add('wifi')
-        if not get_config(self.db, 'system_processing_enabled', True):
-            disabled.add('system')
-        self._disabled_log_types = disabled
-        if disabled:
-            logger.info("Log type filtering active: discarding %s", disabled)
-
-    def start(self):
-        """Start the UDP listener."""
-        self.sock = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
-        self.sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)  # dual-stack: accept IPv4 + IPv6
-        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-
-        # Set receive buffer to 1MB to handle bursts
-        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1048576)
-        actual_rcvbuf = self.sock.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
-        logger.info("UDP socket SO_RCVBUF: requested=1048576, actual=%d", actual_rcvbuf)
-
-        self.sock.bind(('::', SYSLOG_PORT))
-        self.sock.settimeout(1.0)  # Allow periodic batch flushing
-        self.running = True
-
-        logger.info("Syslog receiver listening on UDP port %d", SYSLOG_PORT)
-
-        while self.running:
-            try:
-                data, addr = self.sock.recvfrom(SYSLOG_BUFFER_SIZE)
-                self.last_receive_time = time.time()
-                self._handle_message(data, addr)
-            except socket.timeout:
-                pass
-            except OSError as e:
-                if self.running:
-                    logger.error("Socket error (will retry): %s", e)
-                    time.sleep(0.1)  # Brief pause to avoid tight error loop
-            finally:
-                # Check if batch needs flushing by timeout
-                self._maybe_flush_batch()
-                self._maybe_log_heartbeat()
-
-    def stop(self):
-        """Stop the receiver and flush remaining logs."""
-        logger.info("Stopping syslog receiver...")
-        self.running = False
-        self._flush_batch()
-        if self.sock:
-            self.sock.close()
-        logger.info("Syslog receiver stopped. Stats: %s", self.stats)
-
-    def _handle_message(self, data: bytes, addr: tuple):
-        """Process a single syslog message."""
-        self.stats['received'] += 1
-
-        try:
-            raw_log = data.decode('utf-8', errors='replace').strip()
-        except Exception as e:
-            logger.warning("Failed to decode message from %s: %s", addr, e)
-            self.stats['failed'] += 1
-            return
-
-        if not raw_log:
-            return
-
-        parsed = parse_log(raw_log)
-        if parsed is None:
-            self.stats['failed'] += 1
-            logger.debug("Unparseable log from %s: %.100s...", addr, raw_log)
-            return
-
-        self.stats['parsed'] += 1
-
-        # Filter disabled log types before enrichment
-        log_type = parsed.get('log_type')
-        if log_type in self._disabled_log_types:
-            self.stats['filtered'] += 1
-            return
-
-        # Enrich with GeoIP, ASN, AbuseIPDB, rDNS
-        parsed = self.enricher.enrich(parsed)
-
-        with self.batch_lock:
-            self.batch.append(parsed)
-            if len(self.batch) >= BATCH_SIZE:
-                self._flush_batch()
-
-    def _maybe_flush_batch(self):
-        """Flush batch if timeout elapsed."""
-        if time.time() - self.last_flush >= BATCH_TIMEOUT:
-            with self.batch_lock:
-                if self.batch:
-                    self._flush_batch()
-
-    def _flush_batch(self):
-        """Write current batch to database."""
-        if not self.batch:
-            self.last_flush = time.time()
-            return
-
-        to_insert = self.batch[:]
-        self.batch = []
-        self.last_flush = time.time()
-        batch_len = len(to_insert)
-
-        flush_start = time.time()
-        try:
-            self.db.insert_logs_batch(to_insert)
-            flush_elapsed = time.time() - flush_start
-            self.stats['inserted'] += batch_len
-            if self.consecutive_flush_errors > 0:
-                logger.info("DB insert recovered after %d consecutive failures", self.consecutive_flush_errors)
-            self.consecutive_flush_errors = 0
-            if flush_elapsed > 1.0:
-                logger.warning("Slow DB flush: %d logs took %.2fs (>1s blocks UDP receive)", batch_len, flush_elapsed)
-            else:
-                logger.debug("Flushed %d logs in %.3fs", batch_len, flush_elapsed)
-        except Exception as e:
-            flush_elapsed = time.time() - flush_start
-            self.stats['flush_errors'] += 1
-            self.stats['dropped'] += batch_len
-            self.consecutive_flush_errors += 1
-            logger.error("DB insert failed (%d logs lost, %.2fs, consecutive=%d): %s",
-                         batch_len, flush_elapsed, self.consecutive_flush_errors, e)
-            if self.consecutive_flush_errors >= 5:
-                logger.critical("DB insert failing repeatedly (%d consecutive). "
-                                "UDP packets are likely being dropped. Check DB connectivity.",
-                                self.consecutive_flush_errors)
-
-    def _maybe_log_heartbeat(self):
-        """Periodic heartbeat log to confirm the receiver is alive."""
-        now = time.time()
-        if now - self.last_heartbeat < self.HEARTBEAT_INTERVAL:
-            return
-        self.last_heartbeat = now
-
-        silence = now - self.last_receive_time if self.last_receive_time else 0
-        logger.debug("Heartbeat — received=%d parsed=%d filtered=%d inserted=%d dropped=%d flush_errors=%d silence=%.0fs",
-                     self.stats['received'], self.stats['parsed'], self.stats['filtered'],
-                     self.stats['inserted'], self.stats['dropped'], self.stats['flush_errors'], silence)
-
-        # Warn if no packets received for a long time (gateway may have stopped sending)
-        if self.last_receive_time and silence > 30:
-            logger.warning("No UDP packets received for %.0fs — gateway may have stopped sending or port is unreachable", silence)
-
-
-# ── Network identity gate ────────────────────────────────────────────────────
-
-def _use_log_identity_detection(db: Database) -> bool:
-    """Return True when log-based WAN/gateway detection should run."""
-    return not bool(db.get_config('unifi_enabled', False))
-
-
-def _refresh_network_identity_from_logs(db: Database):
-    """Run log-based WAN/gateway detection only when UniFi is not authoritative."""
-    if not _use_log_identity_detection(db):
-        return
-    try:
-        db.detect_wan_ip()
-    except Exception as e:
-        logger.error("WAN IP detection failed: %s", e)
-    try:
-        db.detect_gateway_ips()
-    except Exception as e:
-        logger.error("Gateway IP detection failed: %s", e)
-
-
-def _log_periodic_stats(db: Database, enricher: Enricher):
-    """Collect and log stats only when DEBUG logging is enabled."""
-    if not logger.isEnabledFor(logging.DEBUG):
-        return
-    db_stats = None
-    enrich_stats = None
-
-    try:
-        db_stats = db.get_stats()
-    except psycopg2.Error as e:
-        logger.error("Failed to get DB stats: %s", e)
-    except Exception as e:
-        # Last-resort safeguard: stats must never break scheduler loop.
-        logger.error("Failed to get DB stats (unexpected): %s", e)
-
-    try:
-        enrich_stats = enricher.get_stats()
-    except Exception as e:
-        # Last-resort safeguard: stats must never break scheduler loop.
-        logger.error("Failed to get enrichment stats (unexpected): %s", e)
-
-    try:
-        if db_stats is not None:
-            logger.debug("DB stats — total: %s, last hour: %s", db_stats['total'], db_stats['last_hour'])
-        if enrich_stats is not None:
-            logger.debug("Enrichment stats — %s", enrich_stats)
-    except (KeyError, TypeError) as e:
-        logger.error("Failed to log stats payload: %s", e)
-
-
-# ── Scheduler ─────────────────────────────────────────────────────────────────
-
-def _retention_cleanup(db: Database):
-    """Run a full retention cleanup pass. Called by the schedule library."""
-    try:
-        cfg = Database.resolve_retention_days(db)
-        logger.info("Retention cleanup starting (general_retention=%d days, dns_retention=%d days)",
-                    cfg.general, cfg.dns)
-        result = db.run_retention_cleanup(cfg.general, cfg.dns)
-        if result['status'] == 'partial':
-            logger.warning("Retention cleanup partial: %d deleted, error: %s",
-                           result['deleted_so_far'], result['error'])
-        elif result['status'] == 'failed':
-            logger.error("Retention cleanup failed: %s", result['error'])
-    except Exception as e:
-        logger.error("Retention cleanup failed: %s", e)
-
-    # rdns_cache sweep — independent pass so a failure here is not misreported
-    # as log-retention failure.
-    try:
-        deleted = db.cleanup_rdns_cache()
-        if deleted:
-            logger.info("rdns_cache retention sweep deleted %d rows", deleted)
-    except Exception as e:
-        logger.warning("rdns_cache retention sweep failed: %s", e)
-
-
-def _register_retention_job(db: Database):
-    """(Re-)register the daily retention cleanup with the saved time.
-
-    MUST only be called on the scheduler thread — mutates the `schedule`
-    module's job registry, which is not thread-safe.
-
-    Tagged 'retention' so we can clear and re-register without touching the
-    other scheduled jobs (stats, blacklist, auth cleanup, wan refresh).
-    """
-    schedule.clear('retention')
-    cfg = Database.resolve_retention_time(db)
-    (schedule.every()
-             .day
-             .at(cfg.time)   # 'HH:MM' — schedule library's native format
-             .do(_retention_cleanup, db=db)
-             .tag('retention'))
-    logger.info("Retention cleanup scheduled daily at %s (source=%s, container-local time)",
-                cfg.time, cfg.source)
-
-
-def _scheduler_tick(db: Database):
-    """One iteration of the scheduler loop — extracted so tests can run it
-    deterministically. Observes the retention-reload Event (set by the signal
-    handler on another thread) and rebuilds the job before dispatching pending
-    runs. All `schedule` registry mutation therefore stays on this thread.
-    """
-    if _retention_reload_requested.is_set():
-        _retention_reload_requested.clear()
-        _register_retention_job(db)
-    schedule.run_pending()
-
-
-def run_scheduler(db: Database, enricher: Enricher, blacklist_fetcher: BlacklistFetcher = None):
-    """Background thread for scheduled tasks (retention cleanup, stats, blacklist)."""
-
-    def log_stats():
-        _log_periodic_stats(db, enricher)
-
-    def retention_cleanup():
-        """Delete logs older than the configured retention window."""
-        try:
-            general, dns = db.resolve_retention_days()
-            result = db.run_retention_cleanup(general, dns)
-            if result['status'] == 'partial':
-                logger.warning("Retention cleanup partial: %d deleted, error: %s",
-                               result['deleted_so_far'], result['error'])
-            elif result['status'] == 'failed':
-                logger.error("Retention cleanup failed: %s", result['error'])
-        except Exception as e:
-            logger.error("Retention cleanup failed: %s", e)
-
-        # Note: audit_log cleanup is handled by auth_cleanup() at 03:30.
-        # Legacy mcp_audit table no longer exists after migration to audit_log.
-    def pull_blacklist():
-        """Fetch the latest IP blacklist and store it in the database."""
-        if blacklist_fetcher:
-            try:
-                blacklist_fetcher.fetch_and_store()
-            except Exception as e:
-                logger.error("Blacklist pull failed: %s", e)
-
-    def refresh_wan_ip():
-        """Refresh WAN/gateway identity from recent log data (no-op when UniFi is active)."""
-        _refresh_network_identity_from_logs(db)
-
-    schedule.every(STATS_INTERVAL_MINUTES).minutes.do(log_stats)
-    schedule.every(WAN_REFRESH_INTERVAL_MINUTES).minutes.do(refresh_wan_ip)
-    _register_retention_job(db)
-    schedule.every().day.at("04:00").do(pull_blacklist)
-    # auth_cleanup has its own internal try/except — no wrapper needed here.
-    schedule.every().day.at("03:30").do(auth_cleanup)
-
-    logger.info("Scheduler started — stats every %dm, WAN refresh every %dm, blacklist daily at 04:00, auth cleanup daily at 03:30",
-                 STATS_INTERVAL_MINUTES, WAN_REFRESH_INTERVAL_MINUTES)
-
-    # Initial blacklist pull after 30s startup delay
-    time.sleep(30)
-    pull_blacklist()
-
-    # Run retention cleanup once at startup so the first cleanup does not have
-    # to wait until the scheduled daily window before executing.
-    _retention_cleanup(db)
-
-    while True:
-        _scheduler_tick(db)
-        time.sleep(10)
-
-
-# ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
     """Entrypoint: initialise the database, enricher, and syslog receiver."""
@@ -493,50 +143,10 @@ def main():
     # Initialize AdGuard Home poller (self-disables when not configured)
     adguard_poller = AdGuardHomePoller(db)
 
-    # Handle graceful shutdown
-    def shutdown(signum, frame):
-        """Handle SIGTERM/SIGINT: flush pending logs and exit cleanly."""
-        logger.info("Received signal %d, shutting down...", signum)
-        receiver.stop()
-        adguard_poller.stop()
-        unifi_api.stop_polling()
-        pihole.stop_polling()
-        enricher.close()
-        db.close()
-        sys.exit(0)
-
-    # Handle GeoIP database reload
-    def reload_geoip(signum, frame):
-        """Handle SIGUSR1: hot-reload GeoIP databases without restarting."""
-        logger.info("Received SIGUSR1, reloading GeoIP databases...")
-        enricher.reload_geoip()
-
-    # Handle config reload
-    def reload_config(signum, frame):
-        """Reload config from database when signaled by API process."""
-        logger.info("Received SIGUSR2, reloading config from database...")
-        parsers.reload_config_from_db(db)
-        unifi_api.reload_config()
-        pihole.reload_config()
-        enricher.reload_config()
-        adguard_poller.reload_config()
-        receiver._load_disabled_types()
-        # scheduler thread will rebuild the retention job on its next tick
-        _retention_reload_requested.set()
-
-        # Write timestamp to confirm reload completed
-        try:
-            from pathlib import Path
-            Path('/tmp/config_reloaded').write_text(str(time.time()))
-        except Exception as e:
-            logger.debug("Failed to write reload timestamp: %s", e)
-
-        logger.info("Config reloaded: WAN=%s", parsers.WAN_INTERFACES)
-
-    signal.signal(signal.SIGTERM, shutdown)
-    signal.signal(signal.SIGINT, shutdown)
-    signal.signal(signal.SIGUSR1, reload_geoip)
-    signal.signal(signal.SIGUSR2, reload_config)
+    signal.signal(signal.SIGTERM, make_shutdown_handler(receiver, adguard_poller, unifi_api, pihole, enricher, db))
+    signal.signal(signal.SIGINT, make_shutdown_handler(receiver, adguard_poller, unifi_api, pihole, enricher, db))
+    signal.signal(signal.SIGUSR1, make_reload_geoip_handler(enricher))
+    signal.signal(signal.SIGUSR2, make_reload_config_handler(db, receiver, unifi_api, pihole, enricher, adguard_poller))
 
     # Start scheduler in background thread
     blacklist_fetcher = BlacklistFetcher(db)

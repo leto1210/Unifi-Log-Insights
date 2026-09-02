@@ -25,15 +25,24 @@ def reset_schedule():
 
 @pytest.fixture
 def main_module(monkeypatch):
-    """Import main.py with heavy deps stubbed."""
+    """Import main.py with heavy deps stubbed.
+
+    main.py re-exports the scheduler helpers, so tests read them via `main`.
+    Database is a module-global in service.scheduler (that's where the helpers
+    actually run), so the fake must be installed there.
+    """
     for name in ('parsers', 'enrichment', 'backfill', 'blacklist',
                  'unifi_api', 'pihole_api', 'routes.auth'):
         monkeypatch.setitem(sys.modules, name, MagicMock())
 
     monkeypatch.delitem(sys.modules, 'main', raising=False)
+    monkeypatch.delitem(sys.modules, 'service.scheduler', raising=False)
     import main
+    from service import scheduler as scheduler_mod
     # Replace the Database reference on the module with a fake for isolation.
-    main.Database = MagicMock()
+    fake_database = MagicMock()
+    scheduler_mod.Database = fake_database
+    main.Database = fake_database  # keep both in sync for tests that read via main
     # Also reset the Event in case another test left it set.
     main._retention_reload_requested.clear()
     return main
