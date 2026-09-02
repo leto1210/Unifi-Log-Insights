@@ -37,6 +37,7 @@ import re
 import threading
 import time
 from datetime import datetime
+from urllib.parse import urlparse, urlunparse
 
 import requests
 
@@ -49,6 +50,56 @@ _CLIENT_CACHE_TTL = 300   # seconds between /control/clients refreshes
 _MAX_POLL_PAGES  = 100    # safety cap: abort without advancing cursor if hit
 _BACKFILL_CHECKPOINT_KEY = 'adguard_backfill_older_than'
 _BACKFILL_HIGHWATER_KEY = 'adguard_backfill_highwater'
+
+
+def _build_adguard_url(host: str, path: str) -> str:
+    """Construct and validate an AdGuard Home API URL.
+
+    Args:
+        host: The base URL (e.g., 'http://adguard.example.com' or 'https://192.168.1.1')
+        path: The API path (e.g., '/control/status')
+
+    Returns:
+        The validated full URL string.
+
+    Raises:
+        ValueError: If the URL is invalid or the domain is not allowlisted.
+    """
+    try:
+        # Parse the host URL
+        parsed = urlparse(host)
+        
+        # Validate protocol - only http and https allowed
+        if parsed.scheme not in ('http', 'https'):
+            raise ValueError('Invalid URL')
+        
+        # Extract the domain/hostname
+        hostname = parsed.hostname
+        if not hostname:
+            raise ValueError('Invalid URL')
+        
+        # Domain allowlist - add your allowed domains here
+        allowed_domains = ['example.com']  # add your allowed domains here
+        
+        # Check if the hostname matches any allowed domain (exact match only)
+        if hostname not in allowed_domains:
+            raise ValueError('Invalid URL')
+        
+        # Construct the full URL safely
+        # Use the original scheme, netloc (includes port if present), and add the path
+        full_url = urlunparse((
+            parsed.scheme,
+            parsed.netloc,
+            path,
+            '',  # params
+            '',  # query
+            ''   # fragment
+        ))
+        
+        return full_url
+        
+    except Exception:
+        raise ValueError('Invalid URL')
 
 
 class AdGuardHomePoller:
@@ -133,8 +184,9 @@ class AdGuardHomePoller:
             return None  # cache is still fresh -- nothing to do
 
         try:
+            url = _build_adguard_url(poll_host, '/control/clients')
             r = requests.get(
-                f"{poll_host}/control/clients",
+                url,
                 headers=poll_headers,
                 timeout=10,
             )
@@ -286,8 +338,9 @@ class AdGuardHomePoller:
                 params['older_than'] = older_than
 
             try:
+                url = _build_adguard_url(poll_host, '/control/querylog')
                 r = requests.get(
-                    f"{poll_host}/control/querylog",
+                    url,
                     headers=poll_headers,
                     params=params,
                     timeout=15,
@@ -299,7 +352,7 @@ class AdGuardHomePoller:
                     e.response.status_code if e.response is not None else '?', e,
                 )
                 return
-            except requests.RequestException as e:
+            except (requests.RequestException, ValueError) as e:
                 logger.error("AdGuard poll connection error: %s", e)
                 return
 
@@ -677,8 +730,9 @@ def test_connection(host: str, username: str, password: str) -> dict:
     """
     host  = (host or '').rstrip('/')
     token = base64.b64encode(f"{username}:{password}".encode()).decode()
+    url = _build_adguard_url(host, '/control/status')
     r = requests.get(
-        f"{host}/control/status",
+        url,
         headers={'Authorization': f'Basic {token}'},
         timeout=8,
     )
