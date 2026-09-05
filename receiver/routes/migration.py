@@ -20,8 +20,25 @@ router = APIRouter()
 # ── Constants ────────────────────────────────────────────────────────────────
 
 APP_TABLES = frozenset({
-    'logs', 'ip_threats', 'system_config', 'unifi_clients',
-    'unifi_devices', 'mcp_tokens', 'mcp_audit', 'saved_views',
+    'logs',
+    'ip_threats',
+    'threat_backfill_queue',
+    'rdns_cache',
+    'system_config',
+    'unifi_clients',
+    'unifi_devices',
+    'saved_views',
+    'roles',
+    'users',
+    'sessions',
+    'api_tokens',
+    'audit_log',
+    'adguard_logs',
+    # Legacy MCP tables and one-time backups may exist on upgraded installs.
+    'mcp_tokens',
+    'mcp_audit',
+    '_mcp_tokens_backup',
+    '_mcp_audit_backup',
 })
 SYSTEM_DBS = frozenset({'postgres', 'template0', 'template1'})
 LOCAL_HOSTS = frozenset({'127.0.0.1', 'localhost', 'localhost.localdomain', '::1'})
@@ -124,6 +141,40 @@ def _connect_params(params: MigrationParams) -> dict:
     return cp
 
 
+def _visible_app_tables(conn) -> set[str]:
+    """Return application tables that are visible in the public schema."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT table_name FROM information_schema.tables
+            WHERE table_schema = 'public'
+        """)
+        return {row[0] for row in cur.fetchall()} & APP_TABLES
+
+
+def _rollback_after_count_error(conn) -> None:
+    """Rollback a failed count query without hiding the original error."""
+    try:
+        conn.rollback()
+    except Exception:
+        logger.debug("Rollback after failed migration count also failed", exc_info=True)
+
+
+def _count_visible_app_rows(conn, label: str) -> dict[str, int]:
+    """Count rows for visible application tables, failing on uncertain counts."""
+    counts = {}
+    visible_tables = _visible_app_tables(conn)
+    with conn.cursor() as cur:
+        for table in sorted(visible_tables):
+            try:
+                cur.execute(f"SELECT count(*) FROM {table}")  # noqa: S608 — table names from constant
+                row = cur.fetchone()
+                counts[table] = row[0] if row else 0
+            except Exception as exc:
+                _rollback_after_count_error(conn)
+                raise RuntimeError(f'Cannot count {label} table "{table}": {exc}') from exc
+    return counts
+
+
 def _host_connectivity_hint(host: str, port: int) -> str:
     """Hint for common Docker-on-same-host routing mistakes."""
     host = host.strip()
@@ -205,16 +256,16 @@ def start_migration(request: Request, params: MigrationParams):
     """Start an async data migration to the specified external PostgreSQL database."""
     _require_migration_auth(request)
     _validate_target(params)
-    with _migration_lock:
-        if _migration_state['status'] == 'running':
-            raise HTTPException(409, "Migration already in progress")
     if is_external_db():
         raise HTTPException(400, "Already using an external database — migration not available")
 
-    _update_state(
-        status='running', step='Starting...', message='',
-        progress_pct=0, details={},
-    )
+    with _migration_lock:
+        if _migration_state['status'] == 'running':
+            raise HTTPException(409, "Migration already in progress")
+        _migration_state.update(
+            status='running', step='Starting...', message='',
+            progress_pct=0, details={},
+        )
     t = threading.Thread(target=_run_migration, args=(params,), daemon=True)
     t.start()
     return {'success': True, 'message': 'Migration started'}
@@ -468,14 +519,7 @@ def _do_migration(params: MigrationParams):
         from deps import get_conn, put_conn
         sconn = get_conn()
         try:
-            with sconn.cursor() as cur:
-                for table in sorted(APP_TABLES):
-                    try:
-                        cur.execute(f"SELECT count(*) FROM {table}")  # noqa: S608 — table names from constant
-                        source_counts[table] = cur.fetchone()[0]
-                    except Exception:
-                        source_counts[table] = -1
-                        sconn.rollback()
+            source_counts = _count_visible_app_rows(sconn, 'source')
         finally:
             put_conn(sconn)
     except Exception as e:
@@ -553,15 +597,10 @@ def _do_migration(params: MigrationParams):
     try:
         conn = psycopg2.connect(**cp)
         conn.autocommit = True
-        with conn.cursor() as cur:
-            for table in sorted(APP_TABLES):
-                try:
-                    cur.execute(f"SELECT count(*) FROM {table}")  # noqa: S608
-                    target_counts[table] = cur.fetchone()[0]
-                except Exception:
-                    target_counts[table] = -1
-                    conn.rollback()
-        conn.close()
+        try:
+            target_counts = _count_visible_app_rows(conn, 'target')
+        finally:
+            conn.close()
     except Exception as e:
         _update_state(status='failed', step='Validation failed',
                       message=f'Cannot connect to target for validation: {e}')
@@ -571,11 +610,14 @@ def _do_migration(params: MigrationParams):
     # Build validation details
     validation = {}
     all_ok = True
-    for table in sorted(APP_TABLES):
-        src = source_counts.get(table, -1)
+    for table in sorted(source_counts):
+        src = source_counts[table]
         tgt = target_counts.get(table, -1)
-        if src <= 0:
-            status = 'ok'  # empty or missing source — trivially fine
+        if tgt < 0:
+            status = 'mismatch'
+            all_ok = False
+        elif src <= 0:
+            status = 'ok'  # empty source table exists and was verifiably counted
         elif tgt < src:
             status = 'mismatch'
             all_ok = False

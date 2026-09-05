@@ -15,24 +15,29 @@ class FakeCursor:
     """Minimal cursor stub that records SQL and can inject failures."""
 
     def __init__(self, fetches=None, on_execute=None):
+        """Store scripted fetch results and optional execute hook."""
         self.fetches = list(fetches or [])
         self.on_execute = on_execute
         self.executed = []
 
     def execute(self, sql, params=None):
+        """Record SQL and invoke the optional failure hook."""
         self.executed.append((sql, params))
         if self.on_execute:
             self.on_execute(sql, params, len(self.executed) - 1)
 
     def fetchone(self):
+        """Return the next scripted fetch row."""
         if self.fetches:
             return self.fetches.pop(0)
         return None
 
     def __enter__(self):
+        """Return self for context manager use."""
         return self
 
     def __exit__(self, exc_type, exc, tb):
+        """Do not swallow exceptions."""
         return False
 
 
@@ -40,9 +45,11 @@ class FakeConn:
     """Connection stub that returns scripted cursors in order."""
 
     def __init__(self, cursors):
+        """Store cursors returned by subsequent cursor() calls."""
         self._cursors = list(cursors)
 
     def cursor(self):
+        """Return the next scripted cursor."""
         if not self._cursors:
             raise AssertionError("No scripted cursor available for this call")
         return self._cursors.pop(0)
@@ -52,11 +59,21 @@ class FakeUniqueViolation(Exception):
     """Patchable UniqueViolation replacement with a psycopg-like diag object."""
 
     def __init__(self, message, primary=None, constraint_name=None):
+        """Create a fake error with PostgreSQL diagnostic fields."""
         super().__init__(message)
         self.diag = SimpleNamespace(
             message_primary=primary or message,
             constraint_name=constraint_name,
         )
+
+
+class FakeInsufficientPrivilege(Exception):
+    """Patchable InsufficientPrivilege replacement with a psycopg-like diag object."""
+
+    def __init__(self, message):
+        """Create a fake privilege error with PostgreSQL diagnostic fields."""
+        super().__init__(message)
+        self.diag = SimpleNamespace(message_primary=message)
 
 
 def _make_database(monkeypatch, cursors, logger=None):
@@ -66,6 +83,7 @@ def _make_database(monkeypatch, cursors, logger=None):
 
     @contextmanager
     def fake_get_conn():
+        """Yield the fake connection used by the Database instance."""
         yield FakeConn(cursors)
 
     monkeypatch.setattr(database, 'get_conn', fake_get_conn)
@@ -98,6 +116,7 @@ def _validation_cursor():
 
 
 def test_ensure_schema_uses_transaction_scoped_advisory_lock(monkeypatch):
+    """Schema migrations should use a transaction-scoped advisory lock."""
     migration_cursor = FakeCursor()
     database, _logger = _make_database(
         monkeypatch,
@@ -115,6 +134,7 @@ def test_ensure_schema_uses_transaction_scoped_advisory_lock(monkeypatch):
 
 
 def test_ensure_schema_has_known_pg_type_race_guard():
+    """The migration code should retain the known pg_type race guard."""
     source = inspect.getsource(Database._ensure_schema)
 
     assert "pg_advisory_xact_lock(20250314)" in source
@@ -123,9 +143,11 @@ def test_ensure_schema_has_known_pg_type_race_guard():
 
 
 def test_ensure_schema_skips_known_pg_type_race(monkeypatch):
+    """Known PostgreSQL pg_type duplicate races are retried safely."""
     raised = False
 
     def on_execute(sql, _params, _idx):
+        """Raise once on logs table creation to simulate the pg_type race."""
         nonlocal raised
         if not raised and "CREATE TABLE IF NOT EXISTS logs" in sql:
             raised = True
@@ -180,6 +202,63 @@ def test_ensure_schema_exits_when_last_seen_at_has_no_default(monkeypatch):
     assert exc.value.code == 1
     logger.critical.assert_called_once()
     assert "no DEFAULT" in logger.critical.call_args[0][0]
+
+
+def test_ensure_schema_exits_when_required_migration_lacks_privilege(monkeypatch):
+    """Boot must abort if a required migration is skipped for insufficient privilege."""
+    migration_sql = "ALTER TABLE logs ADD COLUMN IF NOT EXISTS abuse_usage_type TEXT"
+
+    def on_execute(sql, _params, _idx):
+        """Deny one required migration statement."""
+        if sql == migration_sql:
+            raise FakeInsufficientPrivilege("permission denied for table logs")
+
+    migration_cursor = FakeCursor(on_execute=on_execute)
+    database, logger = _make_database(monkeypatch, [migration_cursor])
+    monkeypatch.setattr(
+        db_module.psycopg2.errors,
+        'InsufficientPrivilege',
+        FakeInsufficientPrivilege,
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        database._ensure_schema()
+
+    assert exc.value.code == 1
+    assert any(
+        sql.startswith("ROLLBACK TO SAVEPOINT")
+        for sql, _params in migration_cursor.executed
+    )
+    logger.warning.assert_not_called()
+    logger.critical.assert_called_once_with("Schema migration failed", exc_info=True)
+    database._backfill_tz_timestamps.assert_not_called()
+
+
+def test_ensure_schema_can_skip_optional_observability_privilege(monkeypatch):
+    """Optional DB observability settings may be skipped without aborting boot."""
+
+    def on_execute(sql, _params, _idx):
+        """Deny only the optional database-level observability setting."""
+        if 'log_autovacuum_min_duration' in sql:
+            raise FakeInsufficientPrivilege("permission denied to set parameter")
+
+    migration_cursor = FakeCursor(on_execute=on_execute)
+    database, logger = _make_database(
+        monkeypatch,
+        [migration_cursor, _validation_cursor()],
+    )
+    monkeypatch.setattr(
+        db_module.psycopg2.errors,
+        'InsufficientPrivilege',
+        FakeInsufficientPrivilege,
+    )
+
+    database._ensure_schema()
+
+    logger.warning.assert_called_once()
+    assert 'insufficient privilege' in logger.warning.call_args[0][0]
+    logger.critical.assert_not_called()
+    database._backfill_tz_timestamps.assert_called_once_with()
 
 
 def test_ensure_post_boot_indexes_skips_if_exists(monkeypatch):
@@ -284,7 +363,9 @@ def test_ensure_schema_does_not_contain_concurrent_ddl():
 
 
 def test_ensure_schema_exits_on_unrelated_unique_violation(monkeypatch):
+    """Unexpected unique violations should abort schema migration."""
     def on_execute(sql, _params, _idx):
+        """Raise a non-pg_type unique violation on logs table creation."""
         if "CREATE TABLE IF NOT EXISTS logs" in sql:
             raise FakeUniqueViolation(
                 'duplicate key value violates unique constraint "saved_views_name_key"',
@@ -437,21 +518,25 @@ def test_post_boot_drops_continue_after_single_failure(monkeypatch):
 # ── Retention validation ──────────────────────────────────────────────────────
 
 def test_validate_retention_days_rejects_zero():
+    """Retention days must reject zero values."""
     with pytest.raises(ValueError, match="positive"):
         Database.validate_retention_days(0, 10)
 
 
 def test_validate_retention_days_rejects_negative():
+    """Retention days must reject negative DNS retention."""
     with pytest.raises(ValueError, match="positive"):
         Database.validate_retention_days(60, -1)
 
 
 def test_validate_retention_days_rejects_non_int():
+    """Retention days must reject non-integer values."""
     with pytest.raises(ValueError, match="integers"):
         Database.validate_retention_days("60", 10)
 
 
 def test_validate_retention_days_accepts_valid():
+    """Retention days accepts positive integer values."""
     # Should not raise
     Database.validate_retention_days(60, 10)
     Database.validate_retention_days(1, 1)
@@ -468,6 +553,7 @@ def test_resolve_retention_time_returns_ui_value(monkeypatch):
 
 
 def test_resolve_retention_time_falls_back_to_env(monkeypatch):
+    """Environment retention time wins when UI value is unset."""
     db = MagicMock()
     db.get_config = MagicMock(return_value=None)
     monkeypatch.setenv('RETENTION_CLEANUP_TIME', '07:45')
@@ -475,6 +561,7 @@ def test_resolve_retention_time_falls_back_to_env(monkeypatch):
 
 
 def test_resolve_retention_time_default_when_unset(monkeypatch):
+    """Default retention time is used when UI and env are unset."""
     # conftest._clean_env already delenv'd both env vars. Test is env-insensitive.
     db = MagicMock()
     db.get_config = MagicMock(return_value=None)
@@ -482,6 +569,7 @@ def test_resolve_retention_time_default_when_unset(monkeypatch):
 
 
 def test_resolve_retention_time_invalid_env_string_falls_to_default(monkeypatch):
+    """Invalid environment retention time falls back to default."""
     db = MagicMock()
     db.get_config = MagicMock(return_value=None)
     monkeypatch.setenv('RETENTION_CLEANUP_TIME', 'not-a-time')
@@ -489,6 +577,7 @@ def test_resolve_retention_time_invalid_env_string_falls_to_default(monkeypatch)
 
 
 def test_resolve_retention_time_out_of_range_env_falls_to_default(monkeypatch):
+    """Out-of-range environment retention time falls back to default."""
     db = MagicMock()
     db.get_config = MagicMock(return_value=None)
     monkeypatch.setenv('RETENTION_CLEANUP_TIME', '25:00')
@@ -567,6 +656,7 @@ def test_resolve_retention_time_invalid_legacy_env_falls_to_default(monkeypatch)
 # ── parse_retention_time direct coverage ─────────────────────────────────────
 
 def test_parse_retention_time_accepts_minute_precision():
+    """parse_retention_time accepts HH:MM boundary values."""
     from db import parse_retention_time
     assert parse_retention_time('23:17') == '23:17'
     assert parse_retention_time('00:00') == '00:00'
@@ -574,12 +664,14 @@ def test_parse_retention_time_accepts_minute_precision():
 
 
 def test_parse_retention_time_zero_pads():
+    """parse_retention_time zero-pads compact hour/minute inputs."""
     from db import parse_retention_time
     assert parse_retention_time('3:5') == '03:05'
     assert parse_retention_time('9:0') == '09:00'
 
 
 def test_parse_retention_time_rejects_invalid():
+    """parse_retention_time rejects invalid or unsupported inputs."""
     from db import parse_retention_time
     assert parse_retention_time('24:00') is None     # hour out of range
     assert parse_retention_time('12:60') is None     # minute out of range
@@ -593,8 +685,10 @@ def test_parse_retention_time_rejects_invalid():
 # ── Retention days resolution ────────────────────────────────────────────────
 
 def test_resolve_retention_days_ui_wins_over_env(monkeypatch):
+    """UI retention-day settings win over environment values."""
     db = MagicMock()
     def get_config(key, *a, **kw):
+        """Return UI values for both retention settings."""
         return {'retention_days': 7, 'dns_retention_days': 5}.get(key)
     db.get_config = MagicMock(side_effect=get_config)
     monkeypatch.setenv('RETENTION_DAYS', '999')
@@ -603,6 +697,7 @@ def test_resolve_retention_days_ui_wins_over_env(monkeypatch):
 
 
 def test_resolve_retention_days_env_when_ui_unset(monkeypatch):
+    """Environment retention-day values win when UI values are unset."""
     db = MagicMock()
     db.get_config = MagicMock(return_value=None)
     monkeypatch.setenv('RETENTION_DAYS', '14')
@@ -611,6 +706,7 @@ def test_resolve_retention_days_env_when_ui_unset(monkeypatch):
 
 
 def test_resolve_retention_days_defaults_when_all_unset():
+    """Default retention-day values are used when all config is unset."""
     # conftest._clean_env scrubs the env; no need to delenv here.
     db = MagicMock()
     db.get_config = MagicMock(return_value=None)
@@ -618,6 +714,7 @@ def test_resolve_retention_days_defaults_when_all_unset():
 
 
 def test_resolve_retention_days_invalid_env_falls_through_to_default(monkeypatch):
+    """Invalid retention-day env values fall back to defaults."""
     db = MagicMock()
     db.get_config = MagicMock(return_value=None)
     monkeypatch.setenv('RETENTION_DAYS', 'not-a-number')
@@ -629,6 +726,7 @@ def test_resolve_retention_days_independent_sources(monkeypatch):
     """General and DNS can resolve from different sources in the same call."""
     db = MagicMock()
     def get_config(key, *a, **kw):
+        """Return only the general retention UI value."""
         return 30 if key == 'retention_days' else None
     db.get_config = MagicMock(side_effect=get_config)
     monkeypatch.setenv('DNS_RETENTION_DAYS', '5')
@@ -641,23 +739,30 @@ class FakeRetentionConn:
     """Simulates a connection that processes batched deletes."""
 
     def __init__(self, dns_rows=0, nondns_rows=0, batch_size=5000):
+        """Store remaining rows for simulated DNS and non-DNS deletes."""
         self._remaining = {'dns': dns_rows, 'non_dns': nondns_rows}
         self._batch_size = batch_size
         self._current_label = None
 
     def cursor(self):
+        """Return a cursor bound to this fake retention connection."""
         return FakeRetentionCursor(self)
 
     def commit(self):
+        """Simulate a successful commit."""
         pass
 
 
 class FakeRetentionCursor:
+    """Cursor that reports rowcount for simulated batched DELETE statements."""
+
     def __init__(self, conn):
+        """Attach the cursor to the fake connection state."""
         self._conn = conn
         self.rowcount = 0
 
     def execute(self, sql, params=None):
+        """Consume one batch from the matching simulated table bucket."""
         if sql and 'DELETE' in sql:
             if "log_type = 'dns'" in sql and "!=" not in sql:
                 label = 'dns'
@@ -669,9 +774,11 @@ class FakeRetentionCursor:
             self.rowcount = batch
 
     def __enter__(self):
+        """Return self for context manager use."""
         return self
 
     def __exit__(self, *args):
+        """Do not swallow exceptions."""
         return False
 
 
@@ -683,6 +790,7 @@ def test_run_retention_cleanup_structured_result(monkeypatch):
 
     @contextmanager
     def fake_get_conn():
+        """Yield a fake retention connection and persist remaining row state."""
         conn = FakeRetentionConn(
             dns_rows=remaining['dns'],
             nondns_rows=remaining['non_dns'],
@@ -710,6 +818,7 @@ def test_run_retention_cleanup_no_data(monkeypatch):
 
     @contextmanager
     def fake_get_conn():
+        """Yield a fake retention connection with no expired data."""
         conn = FakeRetentionConn(dns_rows=remaining['dns'], nondns_rows=remaining['non_dns'])
         yield conn
         remaining['dns'] = conn._remaining['dns']
@@ -744,6 +853,7 @@ def test_run_retention_cleanup_progress_callback(monkeypatch):
 
     @contextmanager
     def fake_get_conn():
+        """Yield a fake retention connection across progress iterations."""
         conn = FakeRetentionConn(
             dns_rows=remaining['dns'],
             nondns_rows=remaining['non_dns'],

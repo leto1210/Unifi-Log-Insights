@@ -557,6 +557,8 @@ class Database:
                             cur.execute(f"RELEASE SAVEPOINT sp_{i}")
                         except psycopg2.errors.InsufficientPrivilege:
                             cur.execute(f"ROLLBACK TO SAVEPOINT sp_{i}")
+                            if 'log_autovacuum_min_duration' not in sql:
+                                raise
                             logger.warning(
                                 "Migration skipped (insufficient privilege): %.80s... "
                                 "Check object ownership and grant privileges to the app DB user.",
