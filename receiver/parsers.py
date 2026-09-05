@@ -490,7 +490,7 @@ def detect_log_type(body: str) -> str:
 def parse_log(raw_log: str) -> dict | None:
     """Parse a raw syslog line into a structured dict.
     
-    Returns None if the log can't be parsed (header doesn't match).
+    Returns None if the header or timestamp cannot be parsed.
     """
     original_raw = raw_log
 
@@ -503,7 +503,13 @@ def parse_log(raw_log: str) -> dict | None:
             return None
         raw_log = stripped
 
-    timestamp = parse_syslog_timestamp(m.group('month'), m.group('day'), m.group('time'))
+    try:
+        timestamp = parse_syslog_timestamp(
+            m.group('month'), m.group('day'), m.group('time')
+        )
+    except (ValueError, TypeError, OverflowError):
+        logger.debug("Invalid syslog timestamp in %.100s", original_raw)
+        return None
     body = m.group('body')
 
     log_type = detect_log_type(body)

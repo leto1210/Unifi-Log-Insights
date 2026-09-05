@@ -36,13 +36,16 @@ def update_pihole_settings(body: dict):
             raise HTTPException(400, 'enrichment must be one of: none, geoip, threat, both')
     
     # Validate host URL if provided
+    normalized_host = None
     if 'host' in body:
         raw_host = body['host']
         if raw_host:
             try:
-                _validate_pihole_url(raw_host)
+                normalized_host = _validate_pihole_url(raw_host)
             except ValueError as e:
                 raise HTTPException(400, str(e))
+        else:
+            normalized_host = ''
 
     # All valid — persist
     current_host = get_config(enricher_db, 'pihole_host', '')
@@ -52,7 +55,7 @@ def update_pihole_settings(body: dict):
         if not body['enabled']:
             set_config(enricher_db, 'pihole_poll_status', None)
     if 'host' in body:
-        set_config(enricher_db, 'pihole_host', body['host'])
+        set_config(enricher_db, 'pihole_host', normalized_host)
     if 'password' in body:
         val = body['password']
         if val:
@@ -63,7 +66,7 @@ def update_pihole_settings(body: dict):
         set_config(enricher_db, 'pihole_enrichment', body['enrichment'])
 
     # Reset cursor when host changes so we re-fetch from the new instance
-    new_host = body.get('host')
+    new_host = normalized_host
     if new_host is not None and new_host != current_host:
         set_config(enricher_db, 'pihole_last_cursor', 0)
 

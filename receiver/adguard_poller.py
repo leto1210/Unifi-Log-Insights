@@ -37,11 +37,11 @@ import re
 import threading
 import time
 from datetime import datetime
-from urllib.parse import urlparse, urlunparse
 
 import requests
 
 from db import AdGuardHostMismatch, Database, decrypt_api_key, get_config, set_config
+from service.integration_urls import build_integration_url
 
 logger = logging.getLogger('adguard_poller')
 
@@ -63,43 +63,9 @@ def _build_adguard_url(host: str, path: str) -> str:
         The validated full URL string.
 
     Raises:
-        ValueError: If the URL is invalid or the domain is not allowlisted.
+        ValueError: If the URL is invalid.
     """
-    try:
-        # Parse the host URL
-        parsed = urlparse(host)
-        
-        # Validate protocol - only http and https allowed
-        if parsed.scheme not in ('http', 'https'):
-            raise ValueError('Invalid URL')
-        
-        # Extract the domain/hostname
-        hostname = parsed.hostname
-        if not hostname:
-            raise ValueError('Invalid URL')
-        
-        # Domain allowlist - add your allowed domains here
-        allowed_domains = ['example.com']  # add your allowed domains here
-        
-        # Check if the hostname matches any allowed domain (exact match only)
-        if hostname not in allowed_domains:
-            raise ValueError('Invalid URL')
-        
-        # Construct the full URL safely
-        # Use the original scheme, netloc (includes port if present), and add the path
-        full_url = urlunparse((
-            parsed.scheme,
-            parsed.netloc,
-            path,
-            '',  # params
-            '',  # query
-            ''   # fragment
-        ))
-        
-        return full_url
-        
-    except Exception:
-        raise ValueError('Invalid URL')
+    return build_integration_url(host, path)
 
 
 class AdGuardHomePoller:

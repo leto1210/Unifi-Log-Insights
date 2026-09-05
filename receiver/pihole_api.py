@@ -23,6 +23,7 @@ import requests
 import urllib3
 
 from db import encrypt_api_key, decrypt_api_key
+from service.integration_urls import normalize_integration_base_url
 
 # Suppress InsecureRequestWarning process-wide. This affects ALL urllib3
 # callers, not just this module. Acceptable here because the only session
@@ -69,42 +70,7 @@ def _validate_pihole_url(url: str) -> str:
     Returns the normalized URL (without trailing slash) on success.
     Raises ValueError with a generic error message on validation failure.
     """
-    if not url:
-        raise ValueError("Invalid URL")
-    
-    try:
-        parsed = urlparse(url)
-        
-        # Protocol validation: only http and https allowed
-        if parsed.scheme not in ('http', 'https'):
-            raise ValueError("Invalid URL")
-        
-        # Domain allowlist - add your allowed domains here
-        allowed_domains = ['example.com']  # add your allowed domains here
-        
-        # Extract hostname (without port)
-        hostname = parsed.hostname
-        if not hostname:
-            raise ValueError("Invalid URL")
-        
-        # Check if hostname is in the allowlist (exact match only, no subdomains)
-        if hostname not in allowed_domains:
-            raise ValueError("Invalid URL")
-        
-        # Reconstruct the URL to ensure it's properly formatted
-        # Include port if specified
-        if parsed.port:
-            netloc = f"{hostname}:{parsed.port}"
-        else:
-            netloc = hostname
-        
-        # Reconstruct without trailing slash
-        normalized = f"{parsed.scheme}://{netloc}{parsed.path.rstrip('/')}"
-        
-        return normalized
-        
-    except (AttributeError, TypeError):
-        raise ValueError("Invalid URL")
+    return normalize_integration_base_url(url, strip_admin_path=True)
 
 
 class _DNSCache:
