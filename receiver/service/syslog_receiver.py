@@ -114,7 +114,14 @@ class SyslogReceiver:
         if not raw_log:
             return
 
-        parsed = parse_log(raw_log)
+        # A UDP datagram is untrusted input. Keep failures isolated to the
+        # current packet so one parser regression cannot terminate the daemon.
+        try:
+            parsed = parse_log(raw_log)
+        except Exception:
+            self.stats['failed'] += 1
+            logger.exception("Unexpected parser failure from %s: %.100s", addr, raw_log)
+            return
         if parsed is None:
             self.stats['failed'] += 1
             logger.debug("Unparseable log from %s: %.100s...", addr, raw_log)
@@ -129,7 +136,12 @@ class SyslogReceiver:
             return
 
         # Enrich with GeoIP, ASN, AbuseIPDB, rDNS
-        parsed = self.enricher.enrich(parsed)
+        try:
+            parsed = self.enricher.enrich(parsed)
+        except Exception:
+            self.stats['failed'] += 1
+            logger.exception("Unexpected enrichment failure from %s: %.100s", addr, raw_log)
+            return
 
         with self.batch_lock:
             self.batch.append(parsed)

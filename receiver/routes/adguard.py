@@ -15,6 +15,7 @@ from pydantic import BaseModel
 from adguard_poller import test_connection
 from db import get_config, set_config, encrypt_api_key
 from deps import enricher_db, signal_receiver, get_conn, put_conn
+from service.integration_urls import normalize_integration_base_url
 
 logger = logging.getLogger('api.adguard')
 
@@ -73,8 +74,14 @@ def put_adguard_config(body: AdGuardConfig):
             detail='poll_interval must be between 15 and 86400 seconds',
         )
 
-    # Normalise host once — strip surrounding whitespace then trailing slashes.
-    normalized_host = body.host.strip().rstrip('/')
+    # Normalise host once so saved config and poller behavior stay identical.
+    if body.host:
+        try:
+            normalized_host = normalize_integration_base_url(body.host)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+    else:
+        normalized_host = ''
 
     if body.enabled and not normalized_host:
         raise HTTPException(
@@ -119,8 +126,8 @@ def test_adguard_connection(body: AdGuardTestRequest):
 
     Returns version and running status on success, or 400 with an error message.
     """
-    normalized_host = body.host.strip().rstrip('/')
     try:
+        normalized_host = normalize_integration_base_url(body.host)
         info = test_connection(normalized_host, body.username, body.password)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f'Connection failed: {e}') from e

@@ -64,6 +64,7 @@ class UniFiAPI:
         # Phase 2: polling state
         self._poll_thread = None
         self._poll_stop = threading.Event()
+        self._lifecycle_lock = threading.RLock()
         self._lock = threading.Lock()
         self._ip_to_name = {}
         self._mac_to_name = {}
@@ -1191,53 +1192,61 @@ class UniFiAPI:
 
     def stop_polling(self):
         """Stop the background polling thread if running."""
-        if self._poll_thread is not None and self._poll_thread.is_alive():
-            self._poll_stop.set()
-            self._poll_thread.join(timeout=5)
-            logger.info("UniFi polling stopped")
+        with self._lifecycle_lock:
+            if self._poll_thread is not None and self._poll_thread.is_alive():
+                self._poll_stop.set()
+                self._poll_thread.join(timeout=5)
+                if self._poll_thread.is_alive():
+                    return False
+                logger.info("UniFi polling stopped")
+            return True
 
     def start_polling(self):
         """Start (or restart) the background polling daemon thread."""
-        # Stop existing thread if running
-        self.stop_polling()
+        with self._lifecycle_lock:
+            # Stop existing thread if running
+            if not self.stop_polling():
+                logger.warning("UniFi polling restart skipped; previous poller is still running")
+                return
 
-        if not self.enabled:
-            return
+            if not self.enabled:
+                return
 
-        # Clear any stale paused flag (toggle was removed, polling always active)
-        self._db.set_config('unifi_polling_paused', False)
+            # Clear any stale paused flag (toggle was removed, polling always active)
+            self._db.set_config('unifi_polling_paused', False)
 
-        poll_interval = int(os.environ.get('UNIFI_POLL_INTERVAL', 0) or
-                            self._db.get_config('unifi_poll_interval', 300))
+            poll_interval = int(os.environ.get('UNIFI_POLL_INTERVAL', 0) or
+                                self._db.get_config('unifi_poll_interval', 300))
 
-        # Load cached maps from DB on cold start
-        try:
-            ip_map, mac_map = self._db.load_device_name_maps()
-            # Also load persisted WAN IP → gateway name mappings
-            wan_ip_names = self._db.get_config('wan_ip_names', {})
-            if wan_ip_names:
-                ip_map.update(wan_ip_names)
-            with self._lock:
-                self._ip_to_name = ip_map
-                self._mac_to_name = mac_map
-            if ip_map:
-                logger.info("Loaded %d cached device names from DB", len(ip_map))
-        except Exception as e:
-            logger.warning("Failed to load cached device names from DB: %s", e)
+            # Load cached maps from DB on cold start
+            try:
+                ip_map, mac_map = self._db.load_device_name_maps()
+                # Also load persisted WAN IP → gateway name mappings
+                wan_ip_names = self._db.get_config('wan_ip_names', {})
+                if wan_ip_names:
+                    ip_map.update(wan_ip_names)
+                with self._lock:
+                    self._ip_to_name = ip_map
+                    self._mac_to_name = mac_map
+                if ip_map:
+                    logger.info("Loaded %d cached device names from DB", len(ip_map))
+            except Exception as e:
+                logger.warning("Failed to load cached device names from DB: %s", e)
 
-        self._poll_stop = threading.Event()
+            self._poll_stop = threading.Event()
+            poll_stop = self._poll_stop
 
-        def _poll_loop():
-            """Run the poll immediately then repeat on a fixed interval until stopped."""
-            # Initial poll immediately
-            self.poll()
-            while not self._poll_stop.wait(poll_interval):
+            def _poll_loop():
+                """Run the poll immediately then repeat on a fixed interval until stopped."""
+                # Initial poll immediately
                 self.poll()
+                while not poll_stop.wait(poll_interval):
+                    self.poll()
 
-        self._poll_thread = threading.Thread(target=_poll_loop, daemon=True,
-                                              name='unifi-poller')
-        self._poll_thread.start()
-        logger.info("UniFi polling started (interval=%ds)", poll_interval)
+            self._poll_thread = threading.Thread(target=_poll_loop, daemon=True,
+                                                  name='unifi-poller')
+            self._poll_thread.start()
+            logger.info("UniFi polling started (interval=%ds)", poll_interval)
 
     def has_device_names(self) -> bool:
         """Return True when the IP-to-name cache has been populated."""

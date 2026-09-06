@@ -23,6 +23,7 @@ import requests
 import urllib3
 
 from db import encrypt_api_key, decrypt_api_key
+from service.integration_urls import normalize_integration_base_url
 
 # Suppress InsecureRequestWarning process-wide. This affects ALL urllib3
 # callers, not just this module. Acceptable here because the only session
@@ -69,42 +70,7 @@ def _validate_pihole_url(url: str) -> str:
     Returns the normalized URL (without trailing slash) on success.
     Raises ValueError with a generic error message on validation failure.
     """
-    if not url:
-        raise ValueError("Invalid URL")
-    
-    try:
-        parsed = urlparse(url)
-        
-        # Protocol validation: only http and https allowed
-        if parsed.scheme not in ('http', 'https'):
-            raise ValueError("Invalid URL")
-        
-        # Domain allowlist - add your allowed domains here
-        allowed_domains = ['example.com']  # add your allowed domains here
-        
-        # Extract hostname (without port)
-        hostname = parsed.hostname
-        if not hostname:
-            raise ValueError("Invalid URL")
-        
-        # Check if hostname is in the allowlist (exact match only, no subdomains)
-        if hostname not in allowed_domains:
-            raise ValueError("Invalid URL")
-        
-        # Reconstruct the URL to ensure it's properly formatted
-        # Include port if specified
-        if parsed.port:
-            netloc = f"{hostname}:{parsed.port}"
-        else:
-            netloc = hostname
-        
-        # Reconstruct without trailing slash
-        normalized = f"{parsed.scheme}://{netloc}{parsed.path.rstrip('/')}"
-        
-        return normalized
-        
-    except (AttributeError, TypeError):
-        raise ValueError("Invalid URL")
+    return normalize_integration_base_url(url, strip_admin_path=True)
 
 
 class _DNSCache:
@@ -158,6 +124,7 @@ class PiHolePoller:
         self._poll_thread = None
         self._poll_stop = threading.Event()
         self._lock = threading.Lock()
+        self._lifecycle_lock = threading.RLock()
         self._last_poll = None
         self._last_poll_error = None
 
@@ -811,54 +778,62 @@ class PiHolePoller:
 
     def start_polling(self):
         """Start (or restart) the background polling daemon thread."""
-        self.stop_polling()
+        with self._lifecycle_lock:
+            if not self.stop_polling():
+                logger.warning("Pi-hole polling restart skipped; previous poller is still running")
+                return
 
-        if not self.enabled:
-            # Clear stale poll status so UI doesn't show "Active" from a previous session
-            try:
-                self._db.set_config('pihole_poll_status', None)
-            except Exception:
-                logger.debug("Failed to clear stale Pi-hole poll status", exc_info=True)
-            return
+            if not self.enabled:
+                # Clear stale poll status so UI doesn't show "Active" from a previous session
+                try:
+                    self._db.set_config('pihole_poll_status', None)
+                except Exception:
+                    logger.debug("Failed to clear stale Pi-hole poll status", exc_info=True)
+                return
 
-        self._poll_stop = threading.Event()
+            self._poll_stop = threading.Event()
 
-        poll_interval = self.poll_interval
+            poll_interval = self.poll_interval
+            poll_stop = self._poll_stop
 
-        def _poll_loop():
-            # Wait for UniFi device name cache to be populated before first poll,
-            # so Pi-hole logs get device names from the start.
-            if self._enricher:
-                for _ in range(10):
-                    if self._poll_stop.is_set():
-                        return
-                    unifi = getattr(self._enricher, 'unifi', None)
-                    if unifi and unifi.has_device_names():
-                        break
-                    time.sleep(1)
-            self.poll()
-            while not self._poll_stop.wait(poll_interval):
+            def _poll_loop():
+                # Wait for UniFi device name cache to be populated before first poll,
+                # so Pi-hole logs get device names from the start.
+                if self._enricher:
+                    for _ in range(10):
+                        if poll_stop.is_set():
+                            return
+                        unifi = getattr(self._enricher, 'unifi', None)
+                        if unifi and unifi.has_device_names():
+                            break
+                        time.sleep(1)
                 self.poll()
+                while not poll_stop.wait(poll_interval):
+                    self.poll()
 
-        self._poll_thread = threading.Thread(target=_poll_loop, daemon=True,
-                                              name='pihole-poller')
-        self._poll_thread.start()
-        logger.info("Pi-hole polling started (interval=%ds)", poll_interval)
+            self._poll_thread = threading.Thread(target=_poll_loop, daemon=True,
+                                                  name='pihole-poller')
+            self._poll_thread.start()
+            logger.info("Pi-hole polling started (interval=%ds)", poll_interval)
 
     def stop_polling(self):
         """Stop the background polling thread if running."""
-        if self._poll_thread is not None and self._poll_thread.is_alive():
-            self._poll_stop.set()
-            self._poll_thread.join(timeout=5)
-            logger.info("Pi-hole polling stopped")
-        # Clear session so restart gets a fresh auth
-        if self._session:
-            try:
-                self._session.close()
-            except Exception:
-                logger.debug("Failed to close Pi-hole session on stop", exc_info=True)
-        self._session = None
-        self._sid = None
+        with self._lifecycle_lock:
+            if self._poll_thread is not None and self._poll_thread.is_alive():
+                self._poll_stop.set()
+                self._poll_thread.join(timeout=5)
+                if self._poll_thread.is_alive():
+                    return False
+                logger.info("Pi-hole polling stopped")
+            # Clear session so restart gets a fresh auth
+            if self._session:
+                try:
+                    self._session.close()
+                except Exception:
+                    logger.debug("Failed to close Pi-hole session on stop", exc_info=True)
+            self._session = None
+            self._sid = None
+            return True
 
     # ── Test Connection ──────────────────────────────────────────────────────
 
