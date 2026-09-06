@@ -925,12 +925,13 @@ class Database:
         entries: list[dict],
         new_cursor: str | None = None,
         expected_host: str | None = None,
+        config_updates: dict[str, object] | None = None,
     ) -> int:
         """Insert a batch of AdGuard Home query log entries and advance the cursor atomically.
 
-        The cursor update (adguard_cursor in system_config) is committed in the
-        same transaction as the row inserts, so only a transaction-commit failure
-        can cause partial application — an extremely rare event.
+        The cursor update (``adguard_cursor``) and optional checkpoint updates
+        are committed in the same transaction as the row inserts, so checkpoint
+        state cannot advance without the matching data.
 
         If ``expected_host`` is provided, the DB value of ``adguard_host`` is
         re-read *inside* the transaction and compared before any inserts occur.
@@ -974,13 +975,9 @@ class Database:
                 # means every row is inserted unconditionally.
                 inserted = len(entries)
                 if new_cursor:
-                    cur.execute(
-                        """INSERT INTO system_config (key, value, updated_at)
-                               VALUES ('adguard_cursor', %s::jsonb, NOW())
-                               ON CONFLICT (key) DO UPDATE
-                               SET value = EXCLUDED.value, updated_at = NOW()""",
-                        [Json(new_cursor)],
-                    )
+                    self._set_config_with_cursor(cur, 'adguard_cursor', new_cursor)
+                for key, value in (config_updates or {}).items():
+                    self._set_config_with_cursor(cur, key, value)
         return inserted
 
     def insert_pihole_batch(self, logs: list[dict], new_cursor: int):

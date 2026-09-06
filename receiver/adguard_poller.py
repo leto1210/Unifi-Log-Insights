@@ -40,7 +40,7 @@ from datetime import datetime
 
 import requests
 
-from db import AdGuardHostMismatch, Database, decrypt_api_key, get_config, set_config
+from db import AdGuardHostMismatch, Database, decrypt_api_key, get_config
 from service.integration_urls import build_integration_url
 
 logger = logging.getLogger('adguard_poller')
@@ -85,6 +85,7 @@ class AdGuardHomePoller:
         self._db = db
         self._stop = threading.Event()
         self._thread = None
+        self._lifecycle_lock = threading.Lock()
         # Structured client cache populated by /control/clients
         self._clients: '_ClientCache' = _ClientCache()
         self._clients_refreshed = 0.0   # epoch seconds of last successful refresh
@@ -413,17 +414,19 @@ class AdGuardHomePoller:
             partial_highwater = _newest_cursor_string(backfill_highwater, newest_in_batch)
             try:
                 inserted = self._db.insert_adguard_batch(
-                    batch, new_cursor=None, expected_host=poll_host,
+                    batch,
+                    new_cursor=None,
+                    expected_host=poll_host,
+                    config_updates={
+                        _BACKFILL_CHECKPOINT_KEY: checkpoint_after_cap,
+                        _BACKFILL_HIGHWATER_KEY: partial_highwater,
+                    },
                 )
             except AdGuardHostMismatch as e:
                 logger.warning(
                     "AdGuard: host changed before commit — discarding capped batch (%s)", e,
                 )
                 return
-
-            set_config(self._db, _BACKFILL_CHECKPOINT_KEY, checkpoint_after_cap)
-            if partial_highwater:
-                set_config(self._db, _BACKFILL_HIGHWATER_KEY, partial_highwater)
 
             # Host confirmed inside transaction — safe to publish client cache.
             if new_clients is not None:
@@ -450,8 +453,17 @@ class AdGuardHomePoller:
         # poll snapshot and the DB write.  If the host changed, AdGuardHostMismatch
         # is raised, the transaction is rolled back, and we discard this batch.
         try:
+            config_updates = None
+            if backfill_checkpoint:
+                config_updates = {
+                    _BACKFILL_CHECKPOINT_KEY: None,
+                    _BACKFILL_HIGHWATER_KEY: None,
+                }
             inserted = self._db.insert_adguard_batch(
-                batch, new_cursor=new_cursor, expected_host=poll_host,
+                batch,
+                new_cursor=new_cursor,
+                expected_host=poll_host,
+                config_updates=config_updates,
             )
         except AdGuardHostMismatch as e:
             logger.warning(
@@ -465,9 +477,6 @@ class AdGuardHomePoller:
             self._clients_refreshed = time.time()
 
         if backfill_checkpoint:
-            # Backlog drained — clear checkpoint state now that cursor is advanced.
-            set_config(self._db, _BACKFILL_CHECKPOINT_KEY, None)
-            set_config(self._db, _BACKFILL_HIGHWATER_KEY, None)
             logger.info("AdGuard: backlog drain complete, cleared paging checkpoint")
 
         logger.debug(
@@ -500,14 +509,22 @@ class AdGuardHomePoller:
 
     def start(self):
         """Launch the poller in a background daemon thread."""
-        self._thread = threading.Thread(
-            target=self.run, daemon=True, name="adguard-poller",
-        )
-        self._thread.start()
+        with self._lifecycle_lock:
+            if self._thread is not None and self._thread.is_alive():
+                logger.info("AdGuard poller already running")
+                return
+            self._stop = threading.Event()
+            self._thread = threading.Thread(
+                target=self.run, daemon=True, name="adguard-poller",
+            )
+            self._thread.start()
 
     def stop(self):
         """Signal the run loop to exit at the end of the current sleep."""
-        self._stop.set()
+        with self._lifecycle_lock:
+            self._stop.set()
+            if self._thread is not None and self._thread.is_alive():
+                self._thread.join(timeout=5)
 
 
 # ── Module-level helpers ──────────────────────────────────────────────────────
