@@ -71,3 +71,6 @@ docs/pentest-agent-harness.md
 
 # Notes de travail locales (lessons.md, snapshots de diagnostic) — non versionnées
 tasks/
+
+# Local OpenAI Codex Security scan artifacts (see scripts/security-scan.sh)
+.security-scan/

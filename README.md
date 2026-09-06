@@ -141,6 +141,33 @@ These are baseline estimates for a small home network. Higher log volume or long
 ##### Threat Map
 <img alt="Map Mobile View" src="docs/screenshots/map-mobile-view.png" />
 
+## 🔐 Local Security Scanning
+
+An optional, on-demand security scan is available via
+[OpenAI Codex Security](https://github.com/openai/codex-security). It is **not**
+part of CI and never runs automatically — it complements the existing CodeQL
+workflow when you want a deeper, LLM-driven pass locally.
+
+Requirements: Node.js ≥ 22.13, plus authentication — either an interactive
+sign-in with your OpenAI/ChatGPT account (no API key needed, best for local
+use) or an `OPENAI_API_KEY` from your environment / a local `.env` (best for
+CI):
+
+```bash
+# One-time interactive sign-in with your ChatGPT / OpenAI account
+npx @openai/codex-security login
+
+# Scan the whole repo
+make security-scan
+
+# Or run the script directly, optionally scoping to a subdirectory
+./scripts/security-scan.sh receiver
+```
+
+Scan artifacts are written under `.security-scan/` (git-ignored). See
+[scripts/security-scan.sh](scripts/security-scan.sh) for alternative providers
+(Bedrock, OpenRouter, Fireworks).
+
 ## 📄 License
 
 Licensed under the [Business Source License 1.1](LICENSE) (BSL 1.1).
