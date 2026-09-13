@@ -1004,3 +1004,114 @@ class TestBackfillRdnsToggle:
         task.db.bulk_upsert_threats = MagicMock(return_value=0)
         task._fix_wan_ip_enrichment()
         e.rdns.lookup.assert_called()
+
+
+# ── AbuseIPDB cache-only lookup + quota safeguards ───────────────────────────
+
+class TestAbuseIPDBLookupCached:
+    def _enricher(self):
+        a = AbuseIPDBEnricher(api_key='k', db=None)
+        a.enabled = True
+        return a
+
+    def test_memory_hit_no_api(self):
+        a = self._enricher()
+        a.cache.set('1.2.3.4', {'threat_score': 42})
+        with patch('enrichment.requests.get') as get:
+            assert a.lookup_cached('1.2.3.4') == {'threat_score': 42}
+            get.assert_not_called()
+
+    def test_db_hit_promoted_no_api(self):
+        db = MagicMock()
+        db.get_threat_cache.return_value = {'threat_score': 7}
+        a = AbuseIPDBEnricher(api_key='k', db=db)
+        a.enabled = True
+        with patch('enrichment.requests.get') as get:
+            assert a.lookup_cached('1.2.3.4') == {'threat_score': 7}
+            get.assert_not_called()
+        assert a.cache.get('1.2.3.4') == {'threat_score': 7}  # promoted
+
+    def test_miss_returns_empty_no_api(self):
+        a = self._enricher()
+        with patch('enrichment.requests.get') as get:
+            assert a.lookup_cached('1.2.3.4') == {}
+            get.assert_not_called()
+
+    def test_excluded_ip_returns_empty(self):
+        a = self._enricher()
+        a.cache.set('9.9.9.9', {'threat_score': 1})
+        a.exclude_ip('9.9.9.9')
+        assert a.lookup_cached('9.9.9.9') == {}
+
+    def test_disabled_returns_empty(self):
+        a = self._enricher()
+        a.enabled = False
+        a.cache.set('1.2.3.4', {'threat_score': 1})
+        assert a.lookup_cached('1.2.3.4') == {}
+
+
+class TestSafetyBufferEnv:
+    def test_default_reserves_headroom(self, monkeypatch):
+        monkeypatch.delenv('ABUSEIPDB_SAFETY_BUFFER', raising=False)
+        assert AbuseIPDBEnricher(api_key='k').SAFETY_BUFFER == 20
+
+    def test_env_override(self, monkeypatch):
+        monkeypatch.setenv('ABUSEIPDB_SAFETY_BUFFER', '50')
+        assert AbuseIPDBEnricher(api_key='k').SAFETY_BUFFER == 50
+
+    def test_invalid_env_falls_back(self, monkeypatch):
+        monkeypatch.setenv('ABUSEIPDB_SAFETY_BUFFER', 'nope')
+        assert AbuseIPDBEnricher(api_key='k').SAFETY_BUFFER == 20
+
+    def test_check_rate_limit_gates_on_buffer(self, monkeypatch):
+        monkeypatch.setenv('ABUSEIPDB_SAFETY_BUFFER', '20')
+        a = AbuseIPDBEnricher(api_key='k')
+        a._rate_limit_remaining = 20   # == buffer → not allowed
+        assert a._check_rate_limit() is False
+        a._rate_limit_remaining = 21   # > buffer → allowed
+        assert a._check_rate_limit() is True
+
+
+class TestEnrichBlockPathIsCacheOnly:
+    def _make_enricher(self, monkeypatch, db):
+        monkeypatch.setattr('enrichment.GeoIPEnricher', MagicMock)
+        monkeypatch.setattr('enrichment.AbuseIPDBEnricher', MagicMock)
+        import db as real_db
+        monkeypatch.setattr(real_db, 'get_wan_ips_from_config', lambda _db: [], raising=False)
+        monkeypatch.setattr(real_db, 'get_config',
+                            lambda _db, key, default=None: default, raising=False)
+        e = Enricher(db=db)
+        e.geoip.lookup = MagicMock(return_value={})
+        e._rdns_enabled = False
+        return e
+
+    def test_block_miss_enqueues_without_api_lookup(self, monkeypatch):
+        db = MagicMock()
+        e = self._make_enricher(monkeypatch, db)
+        e.abuseipdb.enabled = True
+        e.abuseipdb.lookup_cached = MagicMock(return_value={})
+        e.abuseipdb.lookup = MagicMock(return_value={'threat_score': 99})  # must NOT be called
+
+        parsed = {'log_type': 'firewall', 'src_ip': '8.8.8.8',
+                  'dst_ip': '192.168.1.5', 'rule_action': 'block'}
+        out = e.enrich(parsed)
+
+        e.abuseipdb.lookup_cached.assert_called_once_with('8.8.8.8')
+        e.abuseipdb.lookup.assert_not_called()
+        db.enqueue_threat_backfill.assert_called_once()
+        assert 'threat_score' not in out
+
+    def test_block_cache_hit_enriches_without_enqueue(self, monkeypatch):
+        db = MagicMock()
+        e = self._make_enricher(monkeypatch, db)
+        e.abuseipdb.enabled = True
+        e.abuseipdb.lookup_cached = MagicMock(return_value={'threat_score': 88})
+        e.abuseipdb.lookup = MagicMock(return_value={})
+
+        parsed = {'log_type': 'firewall', 'src_ip': '8.8.8.8',
+                  'dst_ip': '192.168.1.5', 'rule_action': 'block'}
+        out = e.enrich(parsed)
+
+        assert out['threat_score'] == 88
+        e.abuseipdb.lookup.assert_not_called()
+        db.enqueue_threat_backfill.assert_not_called()

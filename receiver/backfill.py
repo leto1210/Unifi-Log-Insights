@@ -11,6 +11,7 @@ Background daemon thread that:
 5. Runs one-shot service-name migration with ID cursor
 """
 
+import os
 import time
 import logging
 import threading
@@ -23,6 +24,19 @@ logger = logging.getLogger('backfill')
 
 QUEUE_WORKER_INTERVAL = 300       # 5 minutes
 QUEUE_BATCH_SIZE = 50             # IPs per queue pass
+
+
+def _min_queue_hits() -> int:
+    """Minimum times an IP must be seen before spending /check budget on it.
+
+    Gates the daily AbuseIPDB quota onto recurring offenders and skips
+    one-shot scanners. Configurable via ABUSEIPDB_MIN_HITS (default 3);
+    values < 1 are clamped to 1.
+    """
+    try:
+        return max(1, int(os.environ.get('ABUSEIPDB_MIN_HITS', '3')))
+    except (TypeError, ValueError):
+        return 3
 STALE_REENRICH_BATCH = 10         # Stale IPs per pass
 SERVICE_NAME_BATCH_SIZE = 1000    # Rows per service-name cursor batch
 RULE_ACTION_BATCH_SIZE = 500      # Rows per rule-action cursor batch
@@ -99,7 +113,10 @@ class BackfillTask:
             logger.debug("Queue: no API budget")
             return
 
-        due_ips = self.db.pull_due_queue_batch(limit=QUEUE_BATCH_SIZE)
+        # Bootstrap needs one lookup to learn rate-limit state, so ignore the
+        # hit threshold for that single pass; otherwise gate on recurrence.
+        min_hits = 1 if allow_bootstrap else _min_queue_hits()
+        due_ips = self.db.pull_due_queue_batch(limit=QUEUE_BATCH_SIZE, min_hits=min_hits)
         if not due_ips:
             return
 

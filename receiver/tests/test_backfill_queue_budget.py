@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import sys
 from unittest.mock import MagicMock
 
-from backfill import BackfillTask, QUEUE_BATCH_SIZE
+from backfill import BackfillTask, QUEUE_BATCH_SIZE, _min_queue_hits
 
 
 def _make_task(*, budget: int, enabled: bool, rate_limit_remaining):
@@ -51,7 +51,8 @@ def test_process_queue_pulls_when_bootstrap_allowed(monkeypatch):
 
     task._process_queue()
 
-    db.pull_due_queue_batch.assert_called_once_with(limit=QUEUE_BATCH_SIZE)
+    # Bootstrap pass ignores the hit threshold so it can learn rate-limit state.
+    db.pull_due_queue_batch.assert_called_once_with(limit=QUEUE_BATCH_SIZE, min_hits=1)
 
 
 def test_process_queue_pulls_when_budget_available(monkeypatch):
@@ -67,4 +68,18 @@ def test_process_queue_pulls_when_budget_available(monkeypatch):
 
     task._process_queue()
 
-    db.pull_due_queue_batch.assert_called_once_with(limit=QUEUE_BATCH_SIZE)
+    # Normal (non-bootstrap) pass gates on the recurrence threshold.
+    db.pull_due_queue_batch.assert_called_once_with(
+        limit=QUEUE_BATCH_SIZE, min_hits=_min_queue_hits()
+    )
+
+
+def test_min_queue_hits_env(monkeypatch):
+    monkeypatch.delenv('ABUSEIPDB_MIN_HITS', raising=False)
+    assert _min_queue_hits() == 3
+    monkeypatch.setenv('ABUSEIPDB_MIN_HITS', '5')
+    assert _min_queue_hits() == 5
+    monkeypatch.setenv('ABUSEIPDB_MIN_HITS', '0')  # clamped to >= 1
+    assert _min_queue_hits() == 1
+    monkeypatch.setenv('ABUSEIPDB_MIN_HITS', 'bad')  # fallback
+    assert _min_queue_hits() == 3

@@ -331,7 +331,13 @@ class AbuseIPDBEnricher:
         self.enabled = bool(self.api_key)
         self._lock = threading.Lock()
         self.STALE_DAYS = 4  # Refresh from API after this many days
-        self.SAFETY_BUFFER = 0  # No reserve — first come first serve
+        # Reserve headroom below the hard daily cap so we stop *before* the
+        # provider records an exhausted quota (which triggers the "daily limit
+        # reached" notification email). 0 disables the reserve.
+        try:
+            self.SAFETY_BUFFER = max(0, int(os.environ.get('ABUSEIPDB_SAFETY_BUFFER', '20')))
+        except (TypeError, ValueError):
+            self.SAFETY_BUFFER = 20
 
         # Rate limit state — None means unknown (not yet bootstrapped)
         # After first API call, these are set from response headers
@@ -511,9 +517,40 @@ class AbuseIPDBEnricher:
             except Exception:
                 pass
 
+    def _cache_get(self, ip_str: str):
+        """Read threat data from cache (memory → DB). No guards, no API call.
+
+        Returns the cached dict, or None on a miss. On a DB hit the value is
+        promoted into the in-memory hot cache.
+        """
+        cached = self.cache.get(ip_str)
+        if cached is not None:
+            return cached
+        if self.db:
+            try:
+                db_result = self.db.get_threat_cache(ip_str, max_age_days=self.STALE_DAYS)
+                if db_result:
+                    self.cache.set(ip_str, db_result)  # Promote to memory cache
+                    return db_result
+            except Exception as e:
+                logger.debug("DB threat cache lookup failed for %s: %s", ip_str, e)
+        return None
+
+    def lookup_cached(self, ip_str: str) -> dict:
+        """Cache-only threat lookup (memory → DB); never calls the API.
+
+        Used by the live enrichment path so blocked-firewall events don't
+        consume /check quota inline. Misses are deferred to the backfill queue,
+        where hit-count gating spends the daily budget on recurring IPs rather
+        than one-shot scanners.
+        """
+        if not self.enabled or ip_str in self._excluded_ips:
+            return {}
+        return self._cache_get(ip_str) or {}
+
     def lookup(self, ip_str: str) -> dict:
         """Check an IP against AbuseIPDB. Returns threat_score and categories.
-        
+
         Lookup order:
         1. In-memory cache (hot path, no I/O)
         2. DB ip_threats table (< 4 days old)
@@ -526,20 +563,10 @@ class AbuseIPDBEnricher:
         if ip_str in self._excluded_ips:
             return {}
 
-        # 1. Check in-memory cache
-        cached = self.cache.get(ip_str)
+        # 1-2. Cache (memory → DB)
+        cached = self._cache_get(ip_str)
         if cached is not None:
             return cached
-
-        # 2. Check persistent DB cache
-        if self.db:
-            try:
-                db_result = self.db.get_threat_cache(ip_str, max_age_days=self.STALE_DAYS)
-                if db_result:
-                    self.cache.set(ip_str, db_result)  # Promote to memory cache
-                    return db_result
-            except Exception as e:
-                logger.debug("DB threat cache lookup failed for %s: %s", ip_str, e)
 
         # 3. Check rate limit before API call
         if not self._check_rate_limit():
@@ -976,7 +1003,11 @@ class Enricher:
                 self._touch_threat_coalesced(ip_to_enrich)
         elif (parsed.get('log_type') == 'firewall'
                 and parsed.get('rule_action') == 'block'):
-            threat_data = self.abuseipdb.lookup(ip_to_enrich)
+            # Cache-only on the live path: never spend /check quota inline.
+            # Cached hits enrich immediately; misses are enqueued and the
+            # backfill worker looks them up only after they recur (hit gating),
+            # so one-shot scanners don't drain the daily budget.
+            threat_data = self.abuseipdb.lookup_cached(ip_to_enrich)
             if threat_data:
                 parsed.update(threat_data)
                 self._touch_threat_coalesced(ip_to_enrich)

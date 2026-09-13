@@ -439,6 +439,11 @@ class Database:
             )""",
             """CREATE INDEX IF NOT EXISTS idx_threat_backfill_queue_due
                 ON threat_backfill_queue (next_retry_at, last_seen_at DESC)""",
+            # Hit counter: how many times an IP has been (re)enqueued. Lets the
+            # backfill worker gate /check lookups on recurring IPs and skip
+            # one-shot scanners, conserving the AbuseIPDB daily quota.
+            """ALTER TABLE threat_backfill_queue
+                ADD COLUMN IF NOT EXISTS hits INTEGER NOT NULL DEFAULT 1""",
             # 2. Track recent activity on ip_threats (eliminates OR JOIN to logs)
             "ALTER TABLE ip_threats ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMPTZ DEFAULT NOW()",
             # Ensure default exists even if column was added by an earlier version without one
@@ -1467,12 +1472,17 @@ class Database:
                     "VALUES (%s, %s, NOW(), NOW(), NOW()) "
                     "ON CONFLICT (ip) DO UPDATE "
                     "SET last_seen_at = NOW(), "
+                    "    hits = threat_backfill_queue.hits + 1, "
                     "    next_retry_at = GREATEST(threat_backfill_queue.next_retry_at, NOW())",
                     [ip, source]
                 )
 
-    def pull_due_queue_batch(self, limit: int = 50) -> list[str]:
+    def pull_due_queue_batch(self, limit: int = 50, min_hits: int = 1) -> list[str]:
         """Pull a batch of IPs due for backfill lookup.
+
+        Only IPs seen at least ``min_hits`` times are returned, so the daily
+        AbuseIPDB /check budget is spent on recurring offenders rather than
+        one-shot scanners. Most-seen IPs are prioritised.
 
         Returns bare IP strings (no /32 suffix). Uses FOR UPDATE SKIP LOCKED
         for single-worker safety.
@@ -1482,12 +1492,12 @@ class Database:
                 cur.execute(
                     "WITH due AS ("
                     "  SELECT ip FROM threat_backfill_queue "
-                    "  WHERE next_retry_at <= NOW() "
-                    "  ORDER BY next_retry_at ASC, last_seen_at DESC "
+                    "  WHERE next_retry_at <= NOW() AND hits >= %s "
+                    "  ORDER BY hits DESC, next_retry_at ASC, last_seen_at DESC "
                     "  LIMIT %s "
                     "  FOR UPDATE SKIP LOCKED"
                     ") SELECT host(ip) FROM due",
-                    [limit]
+                    [min_hits, limit]
                 )
                 return [row[0] for row in cur.fetchall()]
 

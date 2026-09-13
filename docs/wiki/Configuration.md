@@ -36,7 +36,9 @@ Self-hosted (UniFi Network Server) controllers use username/password instead of 
 | --- | --- | --- |
 | `MAXMIND_ACCOUNT_ID` | *(empty)* | Numeric ID from MaxMind. Required for cron-driven GeoIP updates. |
 | `MAXMIND_LICENSE_KEY` | *(empty)* | MaxMind license key. |
-| `ABUSEIPDB_API_KEY` | *(empty)* | Enables threat scoring + daily blacklist pre-seed. Free tier = 1000 lookups/day. |
+| `ABUSEIPDB_API_KEY` | *(empty)* | Enables threat scoring + daily blacklist pre-seed. Free tier = 1000 `/check` lookups/day. |
+| `ABUSEIPDB_SAFETY_BUFFER` | `20` | Reserve of daily `/check` calls left unused, so lookups stop *before* the hard cap is hit (avoids the provider's "daily limit reached" email). `0` disables the reserve. |
+| `ABUSEIPDB_MIN_HITS` | `3` | A blocked remote IP must be seen this many times before a `/check` lookup is spent on it. Focuses the daily budget on recurring offenders and skips one-shot scanners. Cached and blacklisted IPs are scored regardless. Minimum `1`. |
 | `RDNS_ENABLED` | `true` | Reverse-DNS lookup with per-status TTL cache. Set to `false` if your resolver is unreliable or you don't want the DNS traffic. |
 
 ## Retention
