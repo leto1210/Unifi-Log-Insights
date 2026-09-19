@@ -38,7 +38,16 @@ def client(monkeypatch):
     monkeypatch.setitem(sys.modules, 'deps', mock_deps)
 
     mock_db_module = MagicMock()
-    mock_db_module.get_config = MagicMock(return_value=None)
+
+    def _get_config(db, key, default=None):
+        # DNS widget checks integration toggles — enable both by default so
+        # the top_dns fetchall mock is exercised. Individual tests can
+        # override via mock_db_module.get_config.side_effect.
+        if key in ('adguard_enabled', 'pihole_enabled'):
+            return True
+        return default
+
+    mock_db_module.get_config = MagicMock(side_effect=_get_config)
     mock_db_module.get_wan_ips_from_config = MagicMock(return_value=[])
     monkeypatch.setitem(sys.modules, 'db', mock_db_module)
 
@@ -229,6 +238,39 @@ class TestStatsTables:
         assert data['top_allowed_countries'] == [{'country': 'CN', 'count': 30}]
         assert data['top_blocked_ips'][0]['ip'] == '1.2.3.4'
         assert data['top_dns'][0]['dns_query'] == 'example.com'
+
+    def test_tables_dns_widget_empty_when_no_integration_enabled(self, client):
+        """Neither adguard_enabled nor pihole_enabled → top_dns is empty and
+        the DNS query is skipped entirely (no cursor.execute for it)."""
+        test_client, mock_deps, mock_db_module = client
+
+        # Override the fixture default that enables both integrations.
+        def _get_config_off(db, key, default=None):
+            if key in ('adguard_enabled', 'pihole_enabled'):
+                return False
+            return default
+        mock_db_module.get_config.side_effect = _get_config_off
+
+        # 7 fetchall calls (all the other top-N helpers), no DNS one this time.
+        _mock_cursor_results(mock_deps, [
+            [{'country': 'US', 'rule_action': 'block', 'count': 50}],  # countries
+            [{'service_name': 'SSH', 'rule_action': 'block', 'count': 40}],  # services
+            [{'ip': '1.2.3.4', 'count': 100, 'country': 'US', 'asn': 'AS1234',
+              'threat_score': 90}],  # top_blocked_ips
+            [{'ip': '192.168.1.10', 'count': 50, 'device_name': 'PC1'}],  # blocked_internal
+            [{'ip': '5.6.7.8', 'count': 25, 'country': 'RU', 'asn': 'AS5678',
+              'city': 'Moscow', 'rdns': None, 'threat_score': 95,
+              'threat_categories': None,
+              'last_seen': datetime(2026, 3, 20, tzinfo=timezone.utc)}],  # threat_ips
+            [{'ip': '8.8.8.8', 'count': 200, 'country': 'US', 'asn': 'Google'}],  # allowed
+            # NOTE: no DNS fetchall — helper short-circuits when both flags off.
+            [{'ip': '192.168.1.20', 'count': 300, 'device_name': 'Server1'}],  # active_internal
+        ])
+
+        resp = test_client.get('/api/stats/tables?time_range=24h')
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data['top_dns'] == []
 
     def test_tables_db_failure(self, client):
         test_client, mock_deps, _ = client

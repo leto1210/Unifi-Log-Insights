@@ -153,29 +153,73 @@ def _query_top_allowed_destinations(cur, cutoff, exclude_ips):
 
 
 def _query_top_dns(cur, cutoff):
-    """Top DNS queries.
+    """Top DNS queries, sourced according to which integrations are enabled.
 
-    Data source: `adguard_logs.domain` (populated by the AdGuard poller
-    — cf. `receiver/adguard_poller.py`). UniFi syslog does not emit DNS
-    query lines in practice — the `log_type='dns'` column exists but
-    every observed deployment ships zero rows there, while an idle
-    UNION against `logs` still triggers a full-range scan through
-    `idx_logs_nondns_timestamp` and can push `/api/stats/tables` past
-    the 30 s statement_timeout. If a future deployment needs the syslog
-    fallback, gate it behind an explicit config flag (e.g. only union
-    when `logs.log_type='dns'` is known to be populated).
+    Both DNS integrations write different targets:
+      * AdGuard poller  → `adguard_logs.domain`
+      * Pi-hole poller  → `logs.log_type='dns' AND dns_query`
+
+    The widget respects the existing `adguard_enabled` / `pihole_enabled`
+    toggles (Settings → Integrations). Enable both → UNION and dedupe by
+    domain. Enable neither → return empty (a truthful state; the widget
+    renders "No data" until the user turns one on).
+
+    Rationale for gating instead of always-UNION: on an AdGuard-only box
+    the Pi-hole CTE scans through `idx_logs_nondns_timestamp` for nothing
+    and can push `/api/stats/tables` past the 30 s statement_timeout.
+    Gating on the enabled flag skips the empty side entirely.
     """
-    cur.execute(
-        """
-        SELECT domain AS dns_query, COUNT(*)::bigint AS count
-        FROM adguard_logs
-        WHERE timestamp >= %s AND domain <> ''
-        GROUP BY domain
-        ORDER BY count DESC
-        LIMIT 10
-        """,
-        [cutoff],
-    )
+    adguard_on = bool(get_config(enricher_db, 'adguard_enabled', False))
+    pihole_on = bool(get_config(enricher_db, 'pihole_enabled', False))
+
+    if adguard_on and pihole_on:
+        cur.execute(
+            """
+            SELECT name AS dns_query, SUM(c)::bigint AS count
+            FROM (
+                SELECT domain AS name, COUNT(*)::bigint AS c
+                FROM adguard_logs
+                WHERE timestamp >= %s AND domain <> ''
+                GROUP BY domain
+                UNION ALL
+                SELECT dns_query AS name, COUNT(*)::bigint AS c
+                FROM logs
+                WHERE log_type = 'dns' AND timestamp >= %s AND dns_query IS NOT NULL
+                GROUP BY dns_query
+            ) merged
+            GROUP BY name
+            ORDER BY count DESC
+            LIMIT 10
+            """,
+            [cutoff, cutoff],
+        )
+    elif adguard_on:
+        cur.execute(
+            """
+            SELECT domain AS dns_query, COUNT(*)::bigint AS count
+            FROM adguard_logs
+            WHERE timestamp >= %s AND domain <> ''
+            GROUP BY domain
+            ORDER BY count DESC
+            LIMIT 10
+            """,
+            [cutoff],
+        )
+    elif pihole_on:
+        cur.execute(
+            """
+            SELECT dns_query, COUNT(*)::bigint AS count
+            FROM logs
+            WHERE log_type = 'dns' AND timestamp >= %s AND dns_query IS NOT NULL
+            GROUP BY dns_query
+            ORDER BY count DESC
+            LIMIT 10
+            """,
+            [cutoff],
+        )
+    else:
+        return []
+
     return [dict(r) for r in cur.fetchall()]
 
 
