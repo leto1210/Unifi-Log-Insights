@@ -18,6 +18,12 @@ from query_helpers import (parse_time_range, build_log_query, validate_time_para
                           VALID_TIME_RANGES, device_name_client_lateral,
                           device_name_device_lateral, device_name_coalesce,
                           sanitize_csv_cell)
+from routes._response_cache import ttl_cache
+
+# Dashboard stats — each first-page-load request runs 4-10 aggregations over
+# the multi-million-row `logs` table. Cache for 30 s so repeated loads /
+# tab-flipping don't re-fire the whole cascade. First hit still pays full cost.
+_STATS_TTL_SECS = 30
 
 logger = logging.getLogger('api.stats')
 
@@ -231,6 +237,7 @@ def _query_traffic_by_action(cur, cutoff, bucket):
 #   - Option 2: Have the dashboard call /api/stats/overview first to render summary cards instantly,
 #     then backfill the rest from /api/stats asynchronously (lazy-load sections)
 @router.get("/api/stats")
+@ttl_cache(_STATS_TTL_SECS)
 def get_stats(
     time_range: str = Query("24h", description="1h,6h,24h,7d,30d,60d"),
 ):
@@ -374,6 +381,7 @@ def get_stats(
 
 
 @router.get("/api/stats/overview")
+@ttl_cache(_STATS_TTL_SECS)
 def get_stats_overview(
     time_range: str = Query("24h", description="1h,6h,24h,7d,30d,60d"),
 ):
@@ -433,6 +441,7 @@ def get_stats_overview(
 
 
 @router.get("/api/stats/tables")
+@ttl_cache(_STATS_TTL_SECS)
 def get_stats_tables(
     time_range: str = Query("24h", description="1h,6h,24h,7d,30d,60d"),
 ):
@@ -517,6 +526,7 @@ def get_stats_tables(
 
 
 @router.get("/api/stats/charts")
+@ttl_cache(_STATS_TTL_SECS)
 def get_stats_charts(
     time_range: str = Query("24h", description="1h,6h,24h,7d,30d,60d"),
 ):

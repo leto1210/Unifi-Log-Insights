@@ -11,6 +11,18 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _clear_stats_response_cache():
+    """Every test gets a fresh response cache. Otherwise a prior test's cached
+    payload short-circuits the DB-mocked path in later tests."""
+    yield
+    try:
+        from routes._response_cache import clear_cache
+        clear_cache()
+    except ImportError:
+        pass
+
+
 @pytest.fixture
 def client(monkeypatch):
     """Create a FastAPI TestClient with mocked deps module."""
