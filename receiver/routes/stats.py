@@ -18,6 +18,12 @@ from query_helpers import (parse_time_range, build_log_query, validate_time_para
                           VALID_TIME_RANGES, device_name_client_lateral,
                           device_name_device_lateral, device_name_coalesce,
                           sanitize_csv_cell)
+from routes._response_cache import ttl_cache
+
+# Dashboard stats — each first-page-load request runs 4-10 aggregations over
+# the multi-million-row `logs` table. Cache for 30 s so repeated loads /
+# tab-flipping don't re-fire the whole cascade. First hit still pays full cost.
+_STATS_TTL_SECS = 30
 
 logger = logging.getLogger('api.stats')
 
@@ -147,13 +153,73 @@ def _query_top_allowed_destinations(cur, cutoff, exclude_ips):
 
 
 def _query_top_dns(cur, cutoff):
-    """Top DNS queries."""
-    cur.execute(
-        "SELECT dns_query, COUNT(*) as count FROM logs "
-        "WHERE timestamp >= %s AND log_type = 'dns' AND dns_query IS NOT NULL "
-        "GROUP BY dns_query ORDER BY count DESC LIMIT 10",
-        [cutoff]
-    )
+    """Top DNS queries, sourced according to which integrations are enabled.
+
+    Both DNS integrations write different targets:
+      * AdGuard poller  → `adguard_logs.domain`
+      * Pi-hole poller  → `logs.log_type='dns' AND dns_query`
+
+    The widget respects the existing `adguard_enabled` / `pihole_enabled`
+    toggles (Settings → Integrations). Enable both → UNION and dedupe by
+    domain. Enable neither → return empty (a truthful state; the widget
+    renders "No data" until the user turns one on).
+
+    Rationale for gating instead of always-UNION: on an AdGuard-only box
+    the Pi-hole CTE scans through `idx_logs_nondns_timestamp` for nothing
+    and can push `/api/stats/tables` past the 30 s statement_timeout.
+    Gating on the enabled flag skips the empty side entirely.
+    """
+    adguard_on = bool(get_config(enricher_db, 'adguard_enabled', False))
+    pihole_on = bool(get_config(enricher_db, 'pihole_enabled', False))
+
+    if adguard_on and pihole_on:
+        cur.execute(
+            """
+            SELECT name AS dns_query, SUM(c)::bigint AS count
+            FROM (
+                SELECT domain AS name, COUNT(*)::bigint AS c
+                FROM adguard_logs
+                WHERE timestamp >= %s AND domain <> ''
+                GROUP BY domain
+                UNION ALL
+                SELECT dns_query AS name, COUNT(*)::bigint AS c
+                FROM logs
+                WHERE log_type = 'dns' AND timestamp >= %s AND dns_query IS NOT NULL
+                GROUP BY dns_query
+            ) merged
+            GROUP BY name
+            ORDER BY count DESC
+            LIMIT 10
+            """,
+            [cutoff, cutoff],
+        )
+    elif adguard_on:
+        cur.execute(
+            """
+            SELECT domain AS dns_query, COUNT(*)::bigint AS count
+            FROM adguard_logs
+            WHERE timestamp >= %s AND domain <> ''
+            GROUP BY domain
+            ORDER BY count DESC
+            LIMIT 10
+            """,
+            [cutoff],
+        )
+    elif pihole_on:
+        cur.execute(
+            """
+            SELECT dns_query, COUNT(*)::bigint AS count
+            FROM logs
+            WHERE log_type = 'dns' AND timestamp >= %s AND dns_query IS NOT NULL
+            GROUP BY dns_query
+            ORDER BY count DESC
+            LIMIT 10
+            """,
+            [cutoff],
+        )
+    else:
+        return []
+
     return [dict(r) for r in cur.fetchall()]
 
 
@@ -231,6 +297,7 @@ def _query_traffic_by_action(cur, cutoff, bucket):
 #   - Option 2: Have the dashboard call /api/stats/overview first to render summary cards instantly,
 #     then backfill the rest from /api/stats asynchronously (lazy-load sections)
 @router.get("/api/stats")
+@ttl_cache(_STATS_TTL_SECS)
 def get_stats(
     time_range: str = Query("24h", description="1h,6h,24h,7d,30d,60d"),
 ):
@@ -374,6 +441,7 @@ def get_stats(
 
 
 @router.get("/api/stats/overview")
+@ttl_cache(_STATS_TTL_SECS)
 def get_stats_overview(
     time_range: str = Query("24h", description="1h,6h,24h,7d,30d,60d"),
 ):
@@ -433,6 +501,7 @@ def get_stats_overview(
 
 
 @router.get("/api/stats/tables")
+@ttl_cache(_STATS_TTL_SECS)
 def get_stats_tables(
     time_range: str = Query("24h", description="1h,6h,24h,7d,30d,60d"),
 ):
@@ -517,6 +586,7 @@ def get_stats_tables(
 
 
 @router.get("/api/stats/charts")
+@ttl_cache(_STATS_TTL_SECS)
 def get_stats_charts(
     time_range: str = Query("24h", description="1h,6h,24h,7d,30d,60d"),
 ):

@@ -110,7 +110,14 @@ pihole_poller = PiHolePoller(db=enricher_db, enricher=None)
 # ── Caching ──────────────────────────────────────────────────────────────────
 
 def ttl_cache(seconds=30):
-    """Thread-safe TTL cache for expensive endpoint results."""
+    """Thread-safe TTL cache for expensive endpoint results.
+
+    LIMITATION: caches a single bucket per decorated function — args/kwargs
+    are ignored. Safe only for parameterless endpoints (e.g. /api/services,
+    /api/protocols, /api/interfaces). For handlers that take query params
+    (time_range, page, filters, …) use `routes._response_cache.ttl_cache`
+    instead — that one keys on kwargs and deep-copies on read.
+    """
     def decorator(fn):
         """Wrap fn with a per-function TTL cache."""
         lock = threading.Lock()
