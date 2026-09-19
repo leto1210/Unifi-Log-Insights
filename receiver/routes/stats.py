@@ -153,12 +153,28 @@ def _query_top_allowed_destinations(cur, cutoff, exclude_ips):
 
 
 def _query_top_dns(cur, cutoff):
-    """Top DNS queries."""
+    """Top DNS queries.
+
+    Data source: `adguard_logs.domain` (populated by the AdGuard poller
+    — cf. `receiver/adguard_poller.py`). UniFi syslog does not emit DNS
+    query lines in practice — the `log_type='dns'` column exists but
+    every observed deployment ships zero rows there, while an idle
+    UNION against `logs` still triggers a full-range scan through
+    `idx_logs_nondns_timestamp` and can push `/api/stats/tables` past
+    the 30 s statement_timeout. If a future deployment needs the syslog
+    fallback, gate it behind an explicit config flag (e.g. only union
+    when `logs.log_type='dns'` is known to be populated).
+    """
     cur.execute(
-        "SELECT dns_query, COUNT(*) as count FROM logs "
-        "WHERE timestamp >= %s AND log_type = 'dns' AND dns_query IS NOT NULL "
-        "GROUP BY dns_query ORDER BY count DESC LIMIT 10",
-        [cutoff]
+        """
+        SELECT domain AS dns_query, COUNT(*)::bigint AS count
+        FROM adguard_logs
+        WHERE timestamp >= %s AND domain <> ''
+        GROUP BY domain
+        ORDER BY count DESC
+        LIMIT 10
+        """,
+        [cutoff],
     )
     return [dict(r) for r in cur.fetchall()]
 
