@@ -6,13 +6,48 @@ import time
 
 from fastapi import APIRouter, HTTPException
 
-from db import get_config, get_wan_ips_from_config
+from db import get_config, set_config, get_wan_ips_from_config
 from enrichment import is_public_ip, get_abuseipdb_stats
-from deps import abuseipdb, enricher_db
+from deps import abuseipdb, enricher_db, signal_receiver
 
 logger = logging.getLogger('api.abuseipdb')
 
 router = APIRouter()
+
+
+@router.get("/api/settings/abuseipdb")
+def get_abuseipdb_settings():
+    """Current AbuseIPDB toggle state. Never returns the API key itself.
+
+    ``configured`` reflects whether ``ABUSEIPDB_API_KEY`` is present (env-only);
+    ``enabled`` is the master kill-switch (defaults to true).
+    """
+    return {
+        "enabled": bool(get_config(enricher_db, "abuseipdb_enabled", True)),
+        "configured": bool(abuseipdb.api_key),
+        "active": bool(abuseipdb.enabled),
+    }
+
+
+@router.put("/api/settings/abuseipdb")
+def update_abuseipdb_settings(body: dict):
+    """Toggle AbuseIPDB on/off without touching the API key.
+
+    Persists ``abuseipdb_enabled``, reloads the local (API-process) enricher so
+    the manual enrich endpoint reacts immediately, and signals the receiver
+    process (SIGUSR2) so the ingestion pipeline and blacklist job pick it up.
+    """
+    if "enabled" not in body:
+        raise HTTPException(status_code=400, detail="Missing 'enabled' field")
+    enabled = bool(body["enabled"])
+    set_config(enricher_db, "abuseipdb_enabled", enabled)
+    abuseipdb.reload_config()
+    signal_receiver()
+    return {
+        "enabled": enabled,
+        "configured": bool(abuseipdb.api_key),
+        "active": bool(abuseipdb.enabled),
+    }
 
 
 @router.get("/api/abuseipdb/status")
@@ -54,8 +89,10 @@ def enrich_ip(ip: str):
     if normalized_ip in excluded:
         raise HTTPException(status_code=400, detail="Cannot enrich WAN/gateway IP")
 
-    if not abuseipdb.enabled:
+    if not abuseipdb.api_key:
         raise HTTPException(status_code=400, detail="AbuseIPDB not configured")
+    if not abuseipdb.enabled:
+        raise HTTPException(status_code=409, detail="integration disabled")
 
     # Budget check: use centralized AbuseIPDB stats from enricher DB
     budget_stats = get_abuseipdb_stats(enricher_db)

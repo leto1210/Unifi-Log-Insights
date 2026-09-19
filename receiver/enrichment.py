@@ -328,7 +328,7 @@ class AbuseIPDBEnricher:
             max_entries=self.MEMORY_CACHE_MAX_ENTRIES,
         )  # 24h in-memory hot cache
         self.db = db  # Database instance for persistent threat cache
-        self.enabled = bool(self.api_key)
+        self.enabled = self._resolve_enabled()
         self._lock = threading.Lock()
         self.STALE_DAYS = 4  # Refresh from API after this many days
         self.SAFETY_BUFFER = 0  # No reserve — first come first serve
@@ -349,8 +349,44 @@ class AbuseIPDBEnricher:
             logger.info("AbuseIPDB enrichment enabled (safety buffer: %d)", self.SAFETY_BUFFER)
             self._load_persisted_stats()
             self._write_stats()
-        else:
+        elif not self.api_key:
             logger.warning("AbuseIPDB API key not set — threat enrichment disabled")
+        else:
+            logger.info("AbuseIPDB enrichment disabled via toggle (abuseipdb_enabled=false)")
+
+    def _resolve_enabled(self) -> bool:
+        """Compute enabled state: master toggle (env > DB > default true) AND api_key present.
+
+        The master toggle is a kill-switch that lets an operator pause AbuseIPDB
+        without removing ``ABUSEIPDB_API_KEY``.  Default is ``true`` so existing
+        installs that rely on "key present == active" keep working after upgrade.
+        """
+        enabled_env = os.environ.get('ABUSEIPDB_ENABLED', '').strip().lower()
+        if enabled_env in ('true', '1', 'yes'):
+            master = True
+        elif enabled_env in ('false', '0', 'no'):
+            master = False
+        elif self.db is not None:
+            master = bool(self.db.get_config('abuseipdb_enabled', True))
+        else:
+            master = True
+        return master and bool(self.api_key)
+
+    def reload_config(self):
+        """Re-read the master toggle and recompute ``enabled`` (called via SIGUSR2/route).
+
+        Bootstraps persisted stats on an off→on transition so a freshly enabled
+        integration restores its rate-limit state without a restart.
+        """
+        was_enabled = self.enabled
+        self.enabled = self._resolve_enabled()
+        if self.enabled and not was_enabled:
+            logger.info("AbuseIPDB enrichment enabled via toggle")
+            self._load_persisted_stats()
+            self._write_stats()
+        elif not self.enabled and was_enabled:
+            logger.info("AbuseIPDB enrichment disabled via toggle")
+        return self.enabled
 
     def _load_persisted_stats(self):
         """Restore rate limit state from database on startup.
@@ -1017,6 +1053,8 @@ class Enricher:
                 logger.debug("Failed to reload pihole_enrichment config", exc_info=True)
         # rDNS toggle reload — env stays authoritative on reload as well.
         self._rdns_enabled = _resolve_rdns_enabled(self._db)
+        # AbuseIPDB master toggle reload (kill-switch without removing the key).
+        self.abuseipdb.reload_config()
 
     def reload_geoip(self):
         """Reload GeoIP databases (called via SIGUSR1)."""
