@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import * as maplibregl from 'maplibre-gl'
-import maplibreWorkerUrl from 'maplibre-gl/dist/maplibre-gl-worker?url'
+import maplibreWorkerUrl from 'maplibre-gl/dist/maplibre-gl-worker.mjs?worker&url'
 import 'maplibre-gl/dist/maplibre-gl.css'
 import { fetchThreatGeo } from '../api'
 import { formatNumber } from '../utils'
@@ -9,6 +9,8 @@ import useTimeRange from '../hooks/useTimeRange'
 import ThreatSidebar from './ThreatSidebar'
 import DateRangePicker from './DateRangePicker'
 
+// MapLibre v6's worker imports a sibling shared module. Vite's worker pipeline
+// bundles that dependency; a plain `?url` import emits only the worker entry.
 maplibregl.setWorkerUrl(maplibreWorkerUrl)
 
 const MODES = [
