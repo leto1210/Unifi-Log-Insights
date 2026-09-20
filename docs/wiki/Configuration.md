@@ -37,8 +37,10 @@ Self-hosted (UniFi Network Server) controllers use username/password instead of 
 | `MAXMIND_ACCOUNT_ID` | *(empty)* | Numeric ID from MaxMind. Required for cron-driven GeoIP updates. |
 | `MAXMIND_LICENSE_KEY` | *(empty)* | MaxMind license key. |
 | `GEOIP_MIN_UPDATE_INTERVAL_HOURS` | `12` | Freshness guard for GeoIP downloads: `geoip-update.sh` skips downloading if the databases were refreshed within this many hours, protecting MaxMind's daily download limit against redeploy/restart storms. The Wed/Sat cron is unaffected (>3 days apart). Set `0` to disable; run `geoip-update.sh --force` to bypass once. |
-| `ABUSEIPDB_API_KEY` | *(empty)* | Enables threat scoring + daily blacklist pre-seed. Free tier = 1000 lookups/day. |
+| `ABUSEIPDB_API_KEY` | *(empty)* | Enables threat scoring + daily blacklist pre-seed. Free tier = 1000 `/check` lookups/day. |
 | `ABUSEIPDB_ENABLED` | `true` | Runtime kill-switch (Settings > Integrations). Pauses all outbound AbuseIPDB calls without removing the key; env var overrides the toggle when set. |
+| `ABUSEIPDB_SAFETY_BUFFER` | `20` | Reserve of daily `/check` calls left unused, so lookups stop *before* the hard cap is hit (avoids the provider's "daily limit reached" email). `0` disables the reserve. |
+| `ABUSEIPDB_MIN_HITS` | `3` | A blocked remote IP must be seen this many times before a `/check` lookup is spent on it. Focuses the daily budget on recurring offenders and skips one-shot scanners. Cached and blacklisted IPs are scored regardless. Minimum `1`. |
 | `RDNS_ENABLED` | `true` | Reverse-DNS lookup with per-status TTL cache. Set to `false` if your resolver is unreliable or you don't want the DNS traffic. |
 
 ## Retention
