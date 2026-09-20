@@ -30,10 +30,20 @@ POST_BOOT_INDEXES = [
     },
 ]
 
-# Redundant indexes dropped on upgrade. Each is a leftmost-prefix of an
-# existing composite so the planner loses nothing, but they incur write
-# amplification on every INSERT. DROP CONCURRENTLY IF EXISTS is idempotent.
+# Redundant / unused indexes dropped on upgrade. DROP CONCURRENTLY IF EXISTS
+# is idempotent. Two rationales:
+#   1. Leftmost-prefix of an existing composite — the planner loses nothing.
+#   2. Low-cardinality single-column index the planner never chose
+#      (idx_scan=0 over days of prod traffic) — pure INSERT write-amplification.
+# Both only cost write throughput on every ingest.
 POST_BOOT_DROPS = [
+    # (1) leftmost-prefix duplicates
     ('idx_logs_type',        "DROP INDEX CONCURRENTLY IF EXISTS idx_logs_type"),
     ('idx_logs_rule_action', "DROP INDEX CONCURRENTLY IF EXISTS idx_logs_rule_action"),
+    # (2) unused low-cardinality single-column indexes (see db/core.py)
+    ('idx_logs_direction',    "DROP INDEX CONCURRENTLY IF EXISTS idx_logs_direction"),
+    ('idx_logs_src_port',     "DROP INDEX CONCURRENTLY IF EXISTS idx_logs_src_port"),
+    ('idx_logs_dst_port',     "DROP INDEX CONCURRENTLY IF EXISTS idx_logs_dst_port"),
+    ('idx_logs_protocol',     "DROP INDEX CONCURRENTLY IF EXISTS idx_logs_protocol"),
+    ('idx_logs_service_name', "DROP INDEX CONCURRENTLY IF EXISTS idx_logs_service_name"),
 ]

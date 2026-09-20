@@ -406,9 +406,14 @@ def test_post_boot_indexes_all_use_concurrently():
 # ── Post-boot drops (issue #85) ──────────────────────────────────────────────
 
 def test_post_boot_drops_list_has_expected_entries():
-    """_POST_BOOT_DROPS contains the two redundant leftmost-prefix indexes."""
+    """_POST_BOOT_DROPS contains the redundant leftmost-prefix indexes plus the
+    unused low-cardinality single-column indexes removed from _ensure_schema."""
     names = {name for name, _sql in Database._POST_BOOT_DROPS}
-    assert names == {'idx_logs_type', 'idx_logs_rule_action'}
+    assert names == {
+        'idx_logs_type', 'idx_logs_rule_action',
+        'idx_logs_direction', 'idx_logs_src_port', 'idx_logs_dst_port',
+        'idx_logs_protocol', 'idx_logs_service_name',
+    }
 
 
 def test_post_boot_drops_all_use_concurrently_and_if_exists():

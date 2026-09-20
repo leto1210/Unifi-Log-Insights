@@ -146,13 +146,14 @@ class Database:
             "CREATE INDEX IF NOT EXISTS idx_logs_timestamp    ON logs (timestamp DESC)",
             "CREATE INDEX IF NOT EXISTS idx_logs_src_ip       ON logs (src_ip)",
             "CREATE INDEX IF NOT EXISTS idx_logs_dst_ip       ON logs (dst_ip)",
-            "CREATE INDEX IF NOT EXISTS idx_logs_direction    ON logs (direction)",
             "CREATE INDEX IF NOT EXISTS idx_logs_threat_score ON logs (threat_score) WHERE threat_score IS NOT NULL",
             "CREATE INDEX IF NOT EXISTS idx_logs_type_time    ON logs (log_type, timestamp DESC)",
             "CREATE INDEX IF NOT EXISTS idx_logs_action_time  ON logs (rule_action, timestamp DESC)",
-            "CREATE INDEX IF NOT EXISTS idx_logs_src_port     ON logs (src_port) WHERE src_port IS NOT NULL",
-            "CREATE INDEX IF NOT EXISTS idx_logs_dst_port     ON logs (dst_port) WHERE dst_port IS NOT NULL",
-            "CREATE INDEX IF NOT EXISTS idx_logs_protocol     ON logs (protocol) WHERE protocol IS NOT NULL",
+            # NOTE: idx_logs_direction / _src_port / _dst_port / _protocol were
+            # removed here — low-cardinality single-column indexes the planner
+            # never chose (idx_scan=0 over days of prod traffic). They only added
+            # INSERT write-amplification. Existing installs drop them via
+            # POST_BOOT_DROPS in db/schema.py.
             # ── Migrations (existing) ─────────────────────────────────────
             # ip_threats persistent cache (added Phase 6)
             """CREATE TABLE IF NOT EXISTS ip_threats (
@@ -178,7 +179,8 @@ class Database:
             "ALTER TABLE ip_threats ADD COLUMN IF NOT EXISTS abuse_is_tor BOOLEAN",
             # IANA service name mapping (after protocol column)
             "ALTER TABLE logs ADD COLUMN IF NOT EXISTS service_name TEXT",
-            "CREATE INDEX IF NOT EXISTS idx_logs_service_name ON logs (service_name) WHERE service_name IS NOT NULL",
+            # idx_logs_service_name removed — unused (idx_scan=0); dropped on
+            # existing installs via POST_BOOT_DROPS in db/schema.py.
             # System configuration table for dynamic settings
             # Must be created before any migration block that may reference it.
             """CREATE TABLE IF NOT EXISTS system_config (
