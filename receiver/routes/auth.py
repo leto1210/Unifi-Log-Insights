@@ -508,8 +508,11 @@ def require_auth(request: Request) -> dict | None:
 @router.get("/api/auth/status")
 def auth_status(request: Request):
     """Public bootstrap endpoint for SPA."""
-    from routes.setup import setup_status as get_setup_status
-    setup_result = get_setup_status()
+    # Read `setup_complete` straight from system_config instead of calling
+    # routes.setup.setup_status(), which also runs a COUNT(*) over the 42 M-row
+    # `logs` table for its `logs_count` field. This endpoint fires on every SPA
+    # page load and never uses logs_count, so that COUNT was ~1 s of wasted work
+    # on each call — see setup_status() for the full (wizard-only) payload.
     auth_enabled = _auth_enabled()
     result = {
         "auth_enabled_effective": auth_enabled,
@@ -517,7 +520,7 @@ def auth_status(request: Request):
         "has_admin": _has_admin(),
         "is_https": get_forwarded_proto(request) == 'https',
         "proxy_trusted": _is_trusted_proxy(request),
-        "setup_complete": setup_result.get('setup_complete', False),
+        "setup_complete": bool(get_config(enricher_db, 'setup_complete', False)),
         "session_ttl_hours": int(get_config(enricher_db, 'auth_session_ttl_hours', 168) or 168),
     }
     # Never expose the proxy token via unauthenticated endpoints (per PR #18).
