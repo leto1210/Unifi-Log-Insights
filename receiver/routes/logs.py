@@ -17,7 +17,19 @@ from ip_identity import load_identity_config, annotate_record, annotate_ip
 from query_helpers import (build_log_query, validate_time_params,
                           device_name_client_lateral, device_name_device_lateral,
                           device_name_coalesce, sanitize_csv_cell)
+# Args-keyed cache for parameterized endpoints. The `ttl_cache` in deps.py
+# is single-bucket and would poison results across different query-param
+# combinations — see docstring there for the constraint.
+from routes._response_cache import ttl_cache as ttl_cache_args
 from services import get_service_description
+
+# `/api/logs` fires a COUNT(*) over the filtered `logs` table before every
+# page fetch. On 7d/30d ranges over 40 M+ rows that COUNT can breach the
+# 30 s pool statement_timeout. Cache identical (paginated + filtered)
+# requests for a short window so switching time ranges back and forth in
+# the Log Stream UI is instant, and give the first hit a longer timeout.
+_LOGS_TTL_SECS = 15
+_LOGS_STATEMENT_TIMEOUT = "90s"
 
 
 
@@ -27,6 +39,7 @@ router = APIRouter()
 
 
 @router.get("/api/logs")
+@ttl_cache_args(_LOGS_TTL_SECS)
 def get_logs(
     log_type: Optional[str] = Query(None, description="Comma-separated: firewall,dns,dhcp,wifi,system"),
     time_range: Optional[str] = Query(None, description="1h,6h,24h,7d,30d,60d"),
@@ -76,6 +89,11 @@ def get_logs(
     conn = get_conn()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            # The COUNT(*) below is what hits the pool-wide 30 s
+            # statement_timeout on wide time ranges (7d/30d over 40 M+ rows).
+            # SET LOCAL scopes to the current transaction only, so the
+            # pooled connection returns to the 30 s baseline after commit.
+            cur.execute(f"SET LOCAL statement_timeout = '{_LOGS_STATEMENT_TIMEOUT}'")
             # Count total
             cur.execute(f"SELECT COUNT(*) as total FROM logs WHERE {where}", params)
             total = cur.fetchone()['total']

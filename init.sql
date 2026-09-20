@@ -306,5 +306,6 @@ CREATE INDEX IF NOT EXISTS idx_audit_log_created_at ON audit_log(created_at);
 INSERT INTO system_config (key, value, updated_at) VALUES
     ('auth_enabled', 'false'::jsonb, NOW()),
     ('auth_session_ttl_hours', '168'::jsonb, NOW()),
-    ('audit_log_retention_days', '90'::jsonb, NOW())
+    ('audit_log_retention_days', '90'::jsonb, NOW()),
+    ('abuseipdb_enabled', 'true'::jsonb, NOW())
 ON CONFLICT (key) DO NOTHING;

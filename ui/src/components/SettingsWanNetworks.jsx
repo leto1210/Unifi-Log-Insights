@@ -1,13 +1,32 @@
 import { useState, useMemo } from 'react'
-import { saveVpnNetworks } from '../api'
+import { saveVpnNetworks, updateUniFiSettings } from '../api'
 import { suggestVpnType, getIfaceDescription, BADGE_LABELS, BADGE_CHOICES } from '../vpnUtils'
 import VpnNetworkTable from './VpnNetworkTable'
 
-export default function SettingsWanNetworks({ unifiEnabled, unifiSettings, wanCards, networkCards, onRestartWizard, vpnNetworks, interfaceLabels, onVpnSaved, unlabeledVpn: rawUnlabeledVpn = [] }) {
+export default function SettingsWanNetworks({ unifiEnabled, unifiSettings, wanCards, networkCards, onRestartWizard, onUnifiChanged, vpnNetworks, interfaceLabels, onVpnSaved, unlabeledVpn: rawUnlabeledVpn = [] }) {
   // Filter out interfaces already present in vpnNetworks to prevent duplicates
   const unlabeledVpn = rawUnlabeledVpn.filter(i => !vpnNetworks[i.name])
   const [imgLoaded, setImgLoaded] = useState(false)
+  const [unifiToggling, setUnifiToggling] = useState(false)
   const gatewayImgUrl = unifiEnabled ? '/api/unifi/gateway-image' : null
+
+  // Credentials remain saved when the integration is toggled off, so we can
+  // distinguish "disabled but configured" from "never set up".
+  const unifiConfigured = !!(unifiSettings?.host
+    && (unifiSettings?.api_key_set || unifiSettings?.username_set))
+
+  async function toggleUnifi(enabled) {
+    if (unifiToggling) return
+    setUnifiToggling(true)
+    try {
+      await updateUniFiSettings({ enabled })
+      onUnifiChanged?.()
+    } catch (e) {
+      console.error('Failed to toggle UniFi integration:', e)
+    } finally {
+      setUnifiToggling(false)
+    }
+  }
 
   // VPN editing state
   const [editVpn, setEditVpn] = useState({})  // {iface: {badge, cidr, label}}
@@ -131,12 +150,21 @@ export default function SettingsWanNetworks({ unifiEnabled, unifiSettings, wanCa
             UniFi Gateway
           </h2>
           {unifiEnabled && (
-            <button
-              onClick={onRestartWizard}
-              className="px-3 py-1.5 rounded text-sm font-medium border border-gray-600 text-gray-300 hover:bg-gray-700 hover:text-white transition-colors"
-            >
-              Reconfigure
-            </button>
+            <div className="flex items-center gap-2">
+              <button
+                onClick={() => toggleUnifi(false)}
+                disabled={unifiToggling}
+                className="px-3 py-1.5 rounded text-sm font-medium border border-gray-600 text-gray-300 hover:bg-gray-700 hover:text-white transition-colors disabled:opacity-50"
+              >
+                {unifiToggling ? 'Disabling...' : 'Disable'}
+              </button>
+              <button
+                onClick={onRestartWizard}
+                className="px-3 py-1.5 rounded text-sm font-medium border border-gray-600 text-gray-300 hover:bg-gray-700 hover:text-white transition-colors"
+              >
+                Reconfigure
+              </button>
+            </div>
           )}
         </div>
         {unifiEnabled ? (
@@ -169,6 +197,27 @@ export default function SettingsWanNetworks({ unifiEnabled, unifiSettings, wanCa
                     : 'Connected via API'}
                 </div>
               </div>
+            </div>
+          </div>
+        ) : unifiConfigured ? (
+          <div className="rounded-lg border border-gray-700 bg-gray-950 px-4 py-3">
+            <div className="flex items-center justify-between">
+              <div className="min-w-0">
+                <span className="flex items-center gap-1.5 text-sm leading-none text-gray-500">
+                  <span className="w-1.5 h-1.5 rounded-full block bg-gray-500" />
+                  Disabled
+                </span>
+                <div className="text-sm text-gray-500 mt-1 truncate">
+                  {unifiSettings?.host} — credentials kept
+                </div>
+              </div>
+              <button
+                onClick={() => toggleUnifi(true)}
+                disabled={unifiToggling}
+                className="px-3 py-1.5 rounded text-sm font-medium border border-gray-600 text-gray-300 hover:bg-gray-700 hover:text-white transition-colors disabled:opacity-50"
+              >
+                {unifiToggling ? 'Enabling...' : 'Enable'}
+              </button>
             </div>
           </div>
         ) : (

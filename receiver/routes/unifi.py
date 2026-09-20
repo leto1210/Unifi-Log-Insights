@@ -29,6 +29,21 @@ _ERR_BULK = "Bulk update failed. One or more policies could not be processed. Ch
 router = APIRouter()
 
 
+def _require_unifi_enabled():
+    """Raise a clear error when UniFi cannot serve an outbound request.
+
+    Distinguishes the kill-switch case (409 ``integration disabled`` — creds are
+    present but the master toggle is off) from a genuinely unconfigured
+    integration (400 ``UniFi API not configured``).
+    """
+    if unifi_api.enabled:
+        return
+    master = get_config(enricher_db, 'unifi_enabled', False)
+    if not master and unifi_api.host:
+        raise HTTPException(status_code=409, detail="integration disabled")
+    raise HTTPException(status_code=400, detail="UniFi API not configured")
+
+
 def _seed_network_identity():
     """Best-effort identity seeding after successful UniFi connection test."""
     try:
@@ -199,8 +214,7 @@ def unifi_network_config():
     Returns WAN interfaces, network/VLAN topology, and VPN networks so the
     UniFi-path setup wizard can initialize without log scans.
     """
-    if not unifi_api.enabled:
-        raise HTTPException(status_code=400, detail="UniFi API not configured")
+    _require_unifi_enabled()
     try:
         result = unifi_api.get_network_config()
         # Include VPN networks so the wizard doesn't need to call network-segments
@@ -274,8 +288,7 @@ def get_gateway_image():
 @router.get("/api/firewall/policies")
 def get_firewall_policies():
     """Fetch all policies + zones (handles pagination internally)."""
-    if not unifi_api.enabled:
-        raise HTTPException(status_code=400, detail="UniFi API not configured")
+    _require_unifi_enabled()
     if not unifi_api.features.get('firewall_management', True):
         raise HTTPException(status_code=400,
             detail="Firewall management requires a UniFi OS gateway (not available on self-hosted controllers)")
@@ -298,8 +311,7 @@ def get_firewall_policies():
 @router.patch("/api/firewall/policies/{policy_id}")
 def patch_firewall_policy(policy_id: str, body: dict):
     """Update a single policy's loggingEnabled."""
-    if not unifi_api.enabled:
-        raise HTTPException(status_code=400, detail="UniFi API not configured")
+    _require_unifi_enabled()
     if not unifi_api.features.get('firewall_management', True):
         raise HTTPException(status_code=400,
             detail="Firewall management requires a UniFi OS gateway (not available on self-hosted controllers)")
@@ -338,8 +350,7 @@ def patch_firewall_policy(policy_id: str, body: dict):
 @router.post("/api/firewall/policies/bulk-logging")
 def bulk_update_logging(body: dict):
     """Batch-update loggingEnabled for multiple policies."""
-    if not unifi_api.enabled:
-        raise HTTPException(status_code=400, detail="UniFi API not configured")
+    _require_unifi_enabled()
     if not unifi_api.features.get('firewall_management', True):
         raise HTTPException(status_code=400,
             detail="Firewall management requires a UniFi OS gateway (not available on self-hosted controllers)")
@@ -362,8 +373,7 @@ def bulk_update_logging(body: dict):
 @router.post("/api/firewall/policies/bulk-logging-stream")
 def bulk_update_logging_stream(body: dict):
     """SSE stream: bulk-update loggingEnabled with live progress events."""
-    if not unifi_api.enabled:
-        raise HTTPException(status_code=400, detail="UniFi API not configured")
+    _require_unifi_enabled()
     if not unifi_api.features.get('firewall_management', True):
         raise HTTPException(status_code=400,
             detail="Firewall management requires a UniFi OS gateway (not available on self-hosted controllers)")

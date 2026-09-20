@@ -34,10 +34,28 @@ class BlacklistFetcher:
         self.api_key = api_key or os.environ.get('ABUSEIPDB_API_KEY', '')
         self.enabled = bool(self.api_key)
 
+    def _master_enabled(self) -> bool:
+        """Read the AbuseIPDB master toggle live (env > DB > default true).
+
+        Checked at fetch time (a daily job) so the kill-switch takes effect
+        without restarting or signalling the scheduler thread.
+        """
+        enabled_env = os.environ.get('ABUSEIPDB_ENABLED', '').strip().lower()
+        if enabled_env in ('true', '1', 'yes'):
+            return True
+        if enabled_env in ('false', '0', 'no'):
+            return False
+        if self.db is not None:
+            return bool(get_config(self.db, 'abuseipdb_enabled', True))
+        return True
+
     def fetch_and_store(self):
         """Pull blacklist and upsert into ip_threats. Returns count of IPs stored."""
-        if not self.enabled:
+        if not self.api_key:
             logger.warning("Blacklist fetch skipped — no API key")
+            return 0
+        if not self._master_enabled():
+            logger.info("Blacklist fetch skipped — AbuseIPDB disabled via toggle")
             return 0
 
         try:

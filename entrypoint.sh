@@ -108,7 +108,7 @@ GEOEOF
     # Run an initial update if databases are missing
     if [ ! -f /app/maxmind/GeoLite2-City.mmdb ]; then
         echo "[entrypoint] No GeoLite2 databases found, running initial download..."
-        /app/geoip-update.sh
+        /app/geoip-update.sh --force
     fi
 
     echo "[entrypoint] GeoIP auto-update configured (Wed & Sat @ 07:00 UTC)"

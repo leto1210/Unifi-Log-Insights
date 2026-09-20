@@ -16,6 +16,14 @@ from ip_identity import load_identity_config, annotate_ip
 from query_helpers import (build_log_query, validate_time_params, ALLOWED_DIMENSIONS,
                           device_name_client_lateral, device_name_device_lateral,
                           device_name_coalesce)
+from routes._response_cache import ttl_cache
+
+# Flow-graph aggregations over the `logs` table time out at the default 30 s
+# statement_timeout on wider ranges (7d+ ≈ 14 M rows through a 3-way GROUP BY).
+# Give the first hit a longer budget, then serve subsequent identical requests
+# from cache so time-range flipping is instantaneous.
+_FLOWS_TTL_SECS = 30
+_FLOWS_STATEMENT_TIMEOUT = "90s"
 
 logger = logging.getLogger('api.flows')
 
@@ -175,6 +183,7 @@ def _lookup_ip_info(conn, nodes):
 
 
 @router.get("/api/flows/graph")
+@ttl_cache(_FLOWS_TTL_SECS)
 def get_flow_graph(
     time_range: Optional[str] = Query("24h"),
     time_from: Optional[str] = Query(None),
@@ -241,6 +250,11 @@ def get_flow_graph(
     try:
         # Tuple cursor — ~288K groups at 30d fits in a few MB vs 30-50 MB with RealDictCursor
         with conn.cursor() as cur:
+            # Raise timeout for this one aggregation — the pool-wide 30s in
+            # deps.py can't cover a 3-way GROUP BY over 14 M+ rows for 7d/30d.
+            # SET LOCAL scopes to the current transaction only, so the pooled
+            # connection returns to the 30 s baseline after commit/rollback.
+            cur.execute(f"SET LOCAL statement_timeout = '{_FLOWS_STATEMENT_TIMEOUT}'")
             cur.execute(sql, base_params)
             grouped_rows = cur.fetchall()
 

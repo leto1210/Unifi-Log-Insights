@@ -390,6 +390,9 @@ class Database:
             """INSERT INTO system_config (key, value, updated_at) VALUES ('auth_enabled', 'false'::jsonb, NOW()) ON CONFLICT (key) DO NOTHING""",
             """INSERT INTO system_config (key, value, updated_at) VALUES ('auth_session_ttl_hours', '168'::jsonb, NOW()) ON CONFLICT (key) DO NOTHING""",
             """INSERT INTO system_config (key, value, updated_at) VALUES ('audit_log_retention_days', '90'::jsonb, NOW()) ON CONFLICT (key) DO NOTHING""",
+            # Integration kill-switch: AbuseIPDB master toggle (default true so
+            # existing installs relying on "key present == active" keep working).
+            """INSERT INTO system_config (key, value, updated_at) VALUES ('abuseipdb_enabled', 'true'::jsonb, NOW()) ON CONFLICT (key) DO NOTHING""",
             # Auth: migrate mcp_tokens data into api_tokens (guarded — table may not exist)
             """DO $$ BEGIN
                 IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'mcp_tokens' AND table_schema = 'public') THEN
