@@ -24,6 +24,13 @@ from routes._response_cache import ttl_cache
 # from cache so time-range flipping is instantaneous.
 _FLOWS_TTL_SECS = 30
 _FLOWS_STATEMENT_TIMEOUT = "90s"
+# The 3-way GROUP BY produces ~4 M groups over a 7d/30d window. At the pooled
+# 64 MB work_mem the planner picks Sort + GroupAggregate, spilling ~1 GB to disk
+# — and that disk sort competes for the same I/O as ingest inserts. 512 MB lets
+# it use an in-memory HashAggregate instead (EXPLAIN cost -34 %, no sort). PG13+
+# HashAggregate spills gracefully if the estimate is exceeded, so this can't OOM.
+# SET LOCAL scopes it to this transaction, so the pooled connection reverts.
+_FLOWS_WORK_MEM = "512MB"
 
 logger = logging.getLogger('api.flows')
 
@@ -255,6 +262,7 @@ def get_flow_graph(
             # SET LOCAL scopes to the current transaction only, so the pooled
             # connection returns to the 30 s baseline after commit/rollback.
             cur.execute(f"SET LOCAL statement_timeout = '{_FLOWS_STATEMENT_TIMEOUT}'")
+            cur.execute(f"SET LOCAL work_mem = '{_FLOWS_WORK_MEM}'")
             cur.execute(sql, base_params)
             grouped_rows = cur.fetchall()
 
