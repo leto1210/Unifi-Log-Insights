@@ -89,6 +89,34 @@ def _resolve_rdns_enabled(db) -> bool:
         return True
 
 
+def resolve_abuseipdb_enabled(db) -> bool:
+    """Resolve the AbuseIPDB master toggle: env > system_config > default(True).
+
+    This deliberately returns the master-toggle state only, not whether an API
+    key is configured. Settings uses it to show the effective operator choice,
+    while callers that make requests must also require credentials.
+    """
+    env = os.environ.get('ABUSEIPDB_ENABLED')
+    if env is not None:
+        parsed = _parse_bool_setting(env)
+        if parsed is not None:
+            return parsed
+        if env.strip():
+            logger.warning(
+                "ABUSEIPDB_ENABLED=%r not recognised; falling through to "
+                "DB/default. Use one of: %s, %s",
+                env, ', '.join(_TRUE_TOKENS), ', '.join(_FALSE_TOKENS),
+            )
+    if db is None:
+        return True
+    try:
+        return _parse_bool_setting(
+            db.get_config('abuseipdb_enabled', True), default=True)
+    except Exception:
+        logger.debug("Failed to read abuseipdb_enabled from system_config", exc_info=True)
+        return True
+
+
 # ── Private/reserved IP detection ─────────────────────────────────────────────
 
 def is_public_ip(ip_str: str) -> bool:
@@ -367,16 +395,7 @@ class AbuseIPDBEnricher:
         without removing ``ABUSEIPDB_API_KEY``.  Default is ``true`` so existing
         installs that rely on "key present == active" keep working after upgrade.
         """
-        enabled_env = os.environ.get('ABUSEIPDB_ENABLED', '').strip().lower()
-        if enabled_env in ('true', '1', 'yes'):
-            master = True
-        elif enabled_env in ('false', '0', 'no'):
-            master = False
-        elif self.db is not None:
-            master = bool(self.db.get_config('abuseipdb_enabled', True))
-        else:
-            master = True
-        return master and bool(self.api_key)
+        return resolve_abuseipdb_enabled(self.db) and bool(self.api_key)
 
     def reload_config(self):
         """Re-read the master toggle and recompute ``enabled`` (called via SIGUSR2/route).
