@@ -20,6 +20,16 @@
 
 Use four spaces and `snake_case` for Python functions/modules; use `PascalCase` for React components and `camelCase` for JavaScript helpers and hooks (`useTimeRange`). Follow surrounding quote and semicolon style—frontend files use two-space indentation and generally omit semicolons. Keep changes focused and preserve package boundaries. Add accurate docstrings as the first statement of Python modules, classes, and functions; modified Python files should retain at least 80% docstring coverage.
 
+## Integration enable/disable flags
+
+Each external integration (UniFi, Pi-hole, AdGuard Home, AbuseIPDB) has an `<integration>_enabled` flag stored in the `system_config` table and resolved with the precedence **env var > DB value > default** (e.g. `ABUSEIPDB_ENABLED` overrides the stored `abuseipdb_enabled`). This flag is the runtime kill-switch surfaced in Settings, and **every code path that touches the integration must respect it**, not just the poller:
+
+- **Pollers / background tasks** gate their loop on the flag and re-read it on `reload_config()` (SIGUSR2).
+- **On-demand outbound routes** return `409 {"detail": "integration disabled"}` when the flag is off (distinct from `400` when the integration was never configured).
+- **Widgets, stats, and any read path** that surfaces integration-sourced data must gate on the same flag rather than querying the underlying table blindly. A widget that reads the data directly (as the old `_query_top_dns` did against `logs.log_type='dns'` while ignoring `adguard_enabled`/`pihole_enabled`) is a bug: it keeps showing data from an integration the user has turned off.
+
+When adding a new integration or a new surface for an existing one, wire it to the flag on both the write path (poller/outbound calls) and the read path (widgets/stats), and add regression coverage for the disabled state. The user-facing behaviour is documented under "Enabling / disabling integrations" in the Configuration wiki.
+
 ## Testing Guidelines
 
 Name backend tests `test_*.py` and frontend tests `*.test.js` or `*.test.jsx`. Add regression coverage near the affected module, including failure paths for database, authentication, and external-service changes. Run both suites when an API contract affects the UI. Syntax-check every changed Python file before submission, for example: `python3 -c "import ast; ast.parse(open('receiver/parsers.py').read())"`.
