@@ -76,6 +76,18 @@ export async function fetchAbuseIPDBStatus() {
   return apiFetch(`${BASE}/abuseipdb/status`)
 }
 
+export async function fetchAbuseIPDBSettings() {
+  return apiFetch(`${BASE}/settings/abuseipdb`)
+}
+
+export async function updateAbuseIPDBSettings(settings) {
+  return apiFetch(`${BASE}/settings/abuseipdb`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(settings),
+  })
+}
+
 export async function enrichIP(ip) {
   return apiFetch(`${BASE}/enrich/${encodeURIComponent(ip)}`, { method: 'POST' })
 }

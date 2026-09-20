@@ -336,6 +336,7 @@ export default function SettingsOverlay({ onClose, startInReconfig, initialSecti
                     wanCards={wanCards}
                     networkCards={networkCards}
                     onRestartWizard={handleRestartWizard}
+                    onUnifiChanged={reloadAll}
                     vpnNetworks={config?.vpn_networks || {}}
                     interfaceLabels={config?.interface_labels || {}}
                     onVpnSaved={() => { fetchConfig().then(cfg => { setConfig(cfg); onVpnSavedApp?.(cfg) }).catch(() => {}) }}
