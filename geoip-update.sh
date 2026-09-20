@@ -20,20 +20,28 @@ if [ "$1" = "--force" ]; then
     FORCE=1
 fi
 
-# Freshness guard: skip if any database was updated within the min interval.
+# Freshness guard: skip only when both databases exist and the older one was
+# updated within the min interval. A partial download must be retried instead
+# of leaving City or ASN data missing/stale until the next cron run.
 if [ "$FORCE" -ne 1 ]; then
-    newest_mtime=0
+    oldest_mtime=0
     for db in "$DB_DIR/GeoLite2-City.mmdb" "$DB_DIR/GeoLite2-ASN.mmdb"; do
-        if [ -f "$db" ]; then
-            mtime=$(stat -c %Y "$db" 2>/dev/null || echo 0)
-            if [ "$mtime" -gt "$newest_mtime" ]; then
-                newest_mtime="$mtime"
-            fi
+        if [ ! -f "$db" ]; then
+            oldest_mtime=0
+            break
+        fi
+        mtime=$(stat -c %Y "$db" 2>/dev/null || echo 0)
+        if [ "$mtime" -le 0 ]; then
+            oldest_mtime=0
+            break
+        fi
+        if [ "$oldest_mtime" -eq 0 ] || [ "$mtime" -lt "$oldest_mtime" ]; then
+            oldest_mtime="$mtime"
         fi
     done
 
-    if [ "$newest_mtime" -gt 0 ]; then
-        age_seconds=$(( $(date +%s) - newest_mtime ))
+    if [ "$oldest_mtime" -gt 0 ]; then
+        age_seconds=$(( $(date +%s) - oldest_mtime ))
         min_seconds=$(( MIN_INTERVAL_HOURS * 3600 ))
         if [ "$age_seconds" -lt "$min_seconds" ]; then
             age_hours=$(( age_seconds / 3600 ))
