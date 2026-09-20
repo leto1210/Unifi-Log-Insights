@@ -580,7 +580,7 @@ def export_csv_endpoint(
 
 
 @router.get("/api/services")
-@ttl_cache(30)
+@ttl_cache(ttl=30)
 def get_services():
     """Return distinct service names for autocomplete filtering."""
     conn = get_conn()
@@ -605,7 +605,7 @@ def get_services():
 
 
 @router.get("/api/protocols")
-@ttl_cache(30)
+@ttl_cache(ttl=30)
 def get_protocols():
     """Return distinct protocols seen in logs for dropdown filtering."""
     conn = get_conn()
