@@ -14,11 +14,20 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
 import requests
+import urllib3
 from requests.exceptions import ConnectionError, Timeout, SSLError
 
 from db import encrypt_api_key, decrypt_api_key
 
 from .exceptions import UniFiPermissionError
+
+# Suppress InsecureRequestWarning process-wide. This affects ALL urllib3
+# callers, not just this module. Acceptable here because the sessions with
+# verify=False talk to self-signed UniFi controllers (UDM/self-hosted). Mirrors
+# the same unconditional disable in pihole_api.py; do NOT re-enable this warning
+# per-instance in _load_config() — that flips global state and fights the
+# Pi-hole disable, which is what let the warning leak on GET /api/settings/unifi.
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 logger = logging.getLogger(__name__)
 
@@ -96,13 +105,8 @@ class UniFiAPI:
         else:
             self.verify_ssl = self._db.get_config('unifi_verify_ssl', True)
 
-        # Suppress noisy InsecureRequestWarning when SSL verification is
-        # disabled AND log level is INFO. DEBUG/WARNING+ still see them.
-        import warnings, urllib3
-        if not self.verify_ssl and logger.getEffectiveLevel() == logging.INFO:
-            warnings.filterwarnings('ignore', category=urllib3.exceptions.InsecureRequestWarning)
-        else:
-            warnings.filterwarnings('default', category=urllib3.exceptions.InsecureRequestWarning)
+        # InsecureRequestWarning is suppressed unconditionally at module import
+        # (see urllib3.disable_warnings above); no per-instance toggling here.
 
         self.features = self._db.get_config('unifi_features', {
             'client_names': True, 'device_discovery': True,
