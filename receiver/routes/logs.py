@@ -17,10 +17,6 @@ from ip_identity import load_identity_config, annotate_record, annotate_ip
 from query_helpers import (build_log_query, validate_time_params,
                           device_name_client_lateral, device_name_device_lateral,
                           device_name_coalesce, sanitize_csv_cell)
-# Args-keyed cache for parameterized endpoints. The `ttl_cache` in deps.py
-# is single-bucket and would poison results across different query-param
-# combinations — see docstring there for the constraint.
-from routes._response_cache import ttl_cache as ttl_cache_args
 from services import get_service_description
 
 # `/api/logs` fires a COUNT(*) over the filtered `logs` table before every
@@ -39,7 +35,7 @@ router = APIRouter()
 
 
 @router.get("/api/logs")
-@ttl_cache_args(_LOGS_TTL_SECS)
+@ttl_cache(_LOGS_TTL_SECS)
 def get_logs(
     log_type: Optional[str] = Query(None, description="Comma-separated: firewall,dns,dhcp,wifi,system"),
     time_range: Optional[str] = Query(None, description="1h,6h,24h,7d,30d,60d"),
@@ -584,7 +580,7 @@ def export_csv_endpoint(
 
 
 @router.get("/api/services")
-@ttl_cache(seconds=30)
+@ttl_cache(30)
 def get_services():
     """Return distinct service names for autocomplete filtering."""
     conn = get_conn()
@@ -609,7 +605,7 @@ def get_services():
 
 
 @router.get("/api/protocols")
-@ttl_cache(seconds=30)
+@ttl_cache(30)
 def get_protocols():
     """Return distinct protocols seen in logs for dropdown filtering."""
     conn = get_conn()

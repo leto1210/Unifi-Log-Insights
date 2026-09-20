@@ -342,7 +342,7 @@ def _get_recent_log_interfaces():
 
 
 @router.get("/api/interfaces")
-@ttl_cache(seconds=30)
+@ttl_cache(30)
 def list_interfaces():
     """Return all discovered interfaces with their labels and type metadata."""
     labels = get_config(enricher_db, "interface_labels", {})
