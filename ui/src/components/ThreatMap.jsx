@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
-import maplibregl from 'maplibre-gl'
-import maplibreWorkerUrl from 'maplibre-gl/dist/maplibre-gl-csp-worker?url'
+import * as maplibregl from 'maplibre-gl'
+import maplibreWorkerUrl from 'maplibre-gl/dist/maplibre-gl-worker?url'
 import 'maplibre-gl/dist/maplibre-gl.css'
 import { fetchThreatGeo } from '../api'
 import { formatNumber } from '../utils'
