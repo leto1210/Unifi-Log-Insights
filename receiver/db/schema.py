@@ -7,14 +7,34 @@ SQL text to appear inside the method body itself.
 """
 
 
+def _log_based_wan_detection_active(db):
+    """Gate for idx_logs_spgist_dst_ip_firewall.
+
+    That 2.5 GB SP-GiST index exists only to accelerate the `dst_ip << subnet`
+    containment scan in Database.detect_gateway_ips(), which runs *solely* when
+    UniFi is not authoritative (``unifi_enabled`` false — see
+    service/network_identity.py). On a UniFi-managed install the query never
+    runs, so the index is pure INSERT write-amplification (maintained on every
+    ingested row for a scan that never happens). Gate creation on log-based
+    detection being active; when it isn't, ensure_post_boot_indexes() drops the
+    index instead, reclaiming the space + write cost — and it comes back
+    automatically if UniFi is later disabled.
+    """
+    return not bool(db.get_config('unifi_enabled', False))
+
+
 # Heavyweight indexes created post-boot with CONCURRENTLY for upgrades.
 # Fresh installs get these from init.sql; this list handles existing installs.
+# Optional 'when' key: a predicate (db) -> bool. When present and it returns
+# False, the index is not wanted on this install — ensure_post_boot_indexes()
+# drops it if present rather than creating it.
 POST_BOOT_INDEXES = [
     {
         'name': 'idx_logs_spgist_dst_ip_firewall',
         'sql': "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_logs_spgist_dst_ip_firewall "
                "ON logs USING spgist (dst_ip) WHERE log_type = 'firewall'",
         'label': 'SP-GiST dst_ip for WAN detection',
+        'when': _log_based_wan_detection_active,
     },
     {
         'name': 'idx_logs_type_id',

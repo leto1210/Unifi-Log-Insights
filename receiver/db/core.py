@@ -718,6 +718,20 @@ class Database:
 
         self._backfill_tz_timestamps()
 
+    def _index_condition_met(self, predicate, name):
+        """Evaluate a POST_BOOT_INDEXES 'when' predicate defensively.
+
+        On any error (e.g. a transient config read failure) default to True so a
+        functional index is never silently dropped — the reconcile retries next
+        boot when the condition can be read cleanly.
+        """
+        try:
+            return bool(predicate(self))
+        except Exception:
+            logger.warning("Gate predicate for %s failed — keeping index", name,
+                           exc_info=True)
+            return True
+
     def ensure_post_boot_indexes(self):
         """Create heavyweight indexes and drop redundant ones for existing installs.
 
@@ -744,6 +758,25 @@ class Database:
         try:
             for idx in self._POST_BOOT_INDEXES:
                 try:
+                    when = idx.get('when')
+                    if when is not None and not self._index_condition_met(when, idx['name']):
+                        # Condition not met on this install — index unwanted.
+                        # Drop it if present so a config change (e.g. UniFi
+                        # enabled) reclaims its space + per-INSERT write cost.
+                        # CONCURRENTLY + short lock_timeout so it can't stall boot.
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                "SELECT 1 FROM pg_indexes WHERE indexname = %s",
+                                (idx['name'],),
+                            )
+                            if cur.fetchone():
+                                logger.info("Dropping %s — condition not met (%s)...",
+                                            idx['name'], idx['label'])
+                                cur.execute("SET lock_timeout = '60s'")
+                                cur.execute(
+                                    f"DROP INDEX CONCURRENTLY IF EXISTS {idx['name']}")
+                                logger.info("Index %s dropped (gated off)", idx['name'])
+                        continue
                     with conn.cursor() as cur:
                         cur.execute(
                             "SELECT 1 FROM pg_indexes WHERE indexname = %s",
@@ -756,7 +789,7 @@ class Database:
                         cur.execute(idx['sql'])
                         logger.info("Index %s created successfully", idx['name'])
                 except Exception:
-                    logger.warning("Could not create %s — will retry next boot",
+                    logger.warning("Could not reconcile %s — will retry next boot",
                                    idx['name'], exc_info=True)
 
             # Drop redundant indexes (idempotent via IF EXISTS). Bound by a
