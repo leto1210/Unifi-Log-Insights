@@ -108,37 +108,12 @@ unifi_api = UniFiAPI(db=enricher_db)
 pihole_poller = PiHolePoller(db=enricher_db, enricher=None)
 
 # ── Caching ──────────────────────────────────────────────────────────────────
-
-def ttl_cache(seconds=30):
-    """Thread-safe TTL cache for expensive endpoint results.
-
-    LIMITATION: caches a single bucket per decorated function — args/kwargs
-    are ignored. Safe only for parameterless endpoints (e.g. /api/services,
-    /api/protocols, /api/interfaces). For handlers that take query params
-    (time_range, page, filters, …) use `routes._response_cache.ttl_cache`
-    instead — that one keys on kwargs and deep-copies on read.
-    """
-    def decorator(fn):
-        """Wrap fn with a per-function TTL cache."""
-        lock = threading.Lock()
-        cached = {'result': None, 'expires': 0}
-
-        @functools.wraps(fn)
-        def wrapper(*args, **kwargs):
-            """Return cached result or call fn and cache the fresh result."""
-            now = time.monotonic()
-            if cached['result'] is not None and now < cached['expires']:
-                return cached['result']
-            with lock:
-                # Double-check after acquiring lock
-                if cached['result'] is not None and now < cached['expires']:
-                    return cached['result']
-                result = fn(*args, **kwargs)
-                cached['result'] = result
-                cached['expires'] = time.monotonic() + seconds
-                return result
-        return wrapper
-    return decorator
+#
+# The single in-process TTL cache lives in the foundational `response_cache`
+# module (no heavy imports, so it stays unit-testable in isolation). Re-exported
+# here so route modules can keep doing `from deps import ttl_cache`, and by
+# `routes._response_cache` for its own historical import sites.
+from response_cache import _cache, clear_cache, ttl_cache  # noqa: F401
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
