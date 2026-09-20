@@ -69,3 +69,6 @@ jobs:
 
       - name: Run tests
         run: npx vitest run
+
+      - name: Build production bundle
+        run: npm run build
