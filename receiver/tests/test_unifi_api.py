@@ -351,3 +351,55 @@ class TestBulkPatchLogging:
 
         assert result['success'] == 2
         assert result['retried'] == 2  # each policy retried once
+
+
+# ── InsecureRequestWarning hygiene (self-signed UniFi controllers) ────────────
+
+
+class TestInsecureRequestWarningHygiene:
+    """The UniFi client talks to self-signed controllers with verify=False.
+
+    The warning must be suppressed process-wide (like pihole_api) and, crucially,
+    building a client must NOT re-enable it per-instance — the old _resolve_config
+    flipped the global filter to 'default', which let the warning leak on
+    GET /api/settings/unifi after pihole_api had disabled it.
+    """
+
+    import warnings as _warnings
+    import urllib3 as _urllib3
+
+    def _make_db(self):
+        mock_db = MagicMock()
+        mock_db.get_config = MagicMock(return_value=None)
+        mock_db.set_config = MagicMock()
+        return mock_db
+
+    def test_resolve_config_does_not_touch_warning_filters(self, monkeypatch):
+        """Building a client (running _resolve_config) must not mutate filters."""
+        calls = []
+        monkeypatch.setattr(
+            self._warnings, 'filterwarnings',
+            lambda *a, **k: calls.append((a, k)),
+        )
+        UniFiAPI(self._make_db())  # runs _resolve_config
+        assert calls == []
+
+    def test_module_import_disables_insecure_warning(self):
+        """Importing the module suppresses InsecureRequestWarning unconditionally.
+
+        Deterministic across pytest's per-test warning-filter management: we clear
+        filters, reload the module, and assert the module registered the 'ignore'
+        filter itself (mirroring pihole_api's unconditional disable).
+        """
+        import importlib
+        import unifi.core as unifi_core
+        with self._warnings.catch_warnings():
+            self._warnings.resetwarnings()
+            importlib.reload(unifi_core)
+            assert any(
+                f[0] == 'ignore' and f[2] is not None
+                and issubclass(self._urllib3.exceptions.InsecureRequestWarning, f[2])
+                for f in self._warnings.filters
+            )
+        # Restore the module under the suite's normal filter state.
+        importlib.reload(unifi_core)
