@@ -384,15 +384,22 @@ class TestInsecureRequestWarningHygiene:
         UniFiAPI(self._make_db())  # runs _resolve_config
         assert calls == []
 
-    def test_warning_suppressed_after_building_client(self):
-        """After construction, InsecureRequestWarning stays suppressed."""
-        UniFiAPI(self._make_db())  # previously re-enabled the warning
-        with self._warnings.catch_warnings(record=True) as rec:
-            self._warnings.warn(
-                "Unverified HTTPS request is being made to host '192.168.2.1'.",
-                self._urllib3.exceptions.InsecureRequestWarning,
+    def test_module_import_disables_insecure_warning(self):
+        """Importing the module suppresses InsecureRequestWarning unconditionally.
+
+        Deterministic across pytest's per-test warning-filter management: we clear
+        filters, reload the module, and assert the module registered the 'ignore'
+        filter itself (mirroring pihole_api's unconditional disable).
+        """
+        import importlib
+        import unifi.core as unifi_core
+        with self._warnings.catch_warnings():
+            self._warnings.resetwarnings()
+            importlib.reload(unifi_core)
+            assert any(
+                f[0] == 'ignore' and f[2] is not None
+                and issubclass(self._urllib3.exceptions.InsecureRequestWarning, f[2])
+                for f in self._warnings.filters
             )
-        assert not any(
-            issubclass(w.category, self._urllib3.exceptions.InsecureRequestWarning)
-            for w in rec
-        )
+        # Restore the module under the suite's normal filter state.
+        importlib.reload(unifi_core)
