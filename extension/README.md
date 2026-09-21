@@ -1,8 +1,19 @@
-# Browser Extension — Archived
+# Browser Extension — Removed from `main`
 
-This directory holds the source of the Chrome/Firefox extension that shipped
-alongside earlier versions of UniFi Insights Plus. It is **no longer
-maintained in this fork** and is kept here for historical reference only.
+The Chrome/Firefox extension that shipped alongside earlier versions of UniFi
+Insights Plus is **no longer maintained in this fork**, and its source has been
+removed from `main`.
+
+## Where the code lives now
+
+The full source and its history are preserved on the **[`archive/extension`](https://github.com/leto1210/Unifi-Log-Insights/tree/archive/extension)**
+branch (the extension directory promoted to the repository root, with all 25
+commits of history intact). Nothing was lost — check it out with:
+
+```sh
+git fetch origin archive/extension
+git switch archive/extension
+```
 
 ## Status
 
@@ -11,15 +22,15 @@ maintained in this fork** and is kept here for historical reference only.
   accounts on the Chrome Web Store and Firefox Add-ons and continue to work
   against a current backend — the API endpoints and the `extension` token
   client type they rely on are still supported.
-- Bug reports and pull requests against the code in this directory will not
-  be actioned.
+- Bug reports and pull requests against the extension code will not be actioned.
 
 ## For users
 
-If you already have the extension installed, no action is required. If you
-want to remove it, uninstall it from your browser's extension manager.
+If you already have the extension installed, no action is required. If you want
+to remove it, uninstall it from your browser's extension manager.
 
 ## For maintainers / forks
 
-Anyone who wants to keep the extension alive is free to fork this directory
-into a standalone repository and publish under their own store accounts.
+Anyone who wants to keep the extension alive is free to branch from
+`archive/extension` into a standalone repository and publish under their own
+store accounts.
