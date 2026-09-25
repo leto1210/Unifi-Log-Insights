@@ -271,6 +271,7 @@ def test_ensure_post_boot_indexes_skips_if_exists(monkeypatch):
     mock_conn.cursor.return_value = mock_cursor
 
     database = Database(conn_params={'user': 'unifi'})
+    database.get_config = MagicMock(return_value=False)  # unifi disabled → spgist gate open
     monkeypatch.setattr('db.psycopg2.connect', lambda **kw: mock_conn)
 
     database.ensure_post_boot_indexes()
@@ -291,6 +292,7 @@ def test_ensure_post_boot_indexes_creates_when_missing(monkeypatch):
     mock_conn.cursor.return_value = mock_cursor
 
     database = Database(conn_params={'user': 'unifi'})
+    database.get_config = MagicMock(return_value=False)  # unifi disabled → spgist gate open
     monkeypatch.setattr('db.psycopg2.connect', lambda **kw: mock_conn)
 
     database.ensure_post_boot_indexes()
@@ -301,6 +303,28 @@ def test_ensure_post_boot_indexes_creates_when_missing(monkeypatch):
     assert 'idx_logs_type_id' in executed_sql
     assert 'idx_logs_nondns_timestamp' in executed_sql
     assert mock_conn.autocommit is True
+
+
+def test_ensure_post_boot_indexes_drops_gated_index_when_condition_unmet(monkeypatch):
+    """When a POST_BOOT_INDEXES 'when' predicate is False (e.g. UniFi is
+    authoritative), the gated index is DROPped CONCURRENTLY instead of created."""
+    mock_conn = MagicMock()
+    mock_cursor = MagicMock()
+    mock_cursor.fetchone.return_value = (1,)  # gated index currently exists
+    mock_cursor.__enter__ = lambda s: s
+    mock_cursor.__exit__ = MagicMock(return_value=False)
+    mock_conn.cursor.return_value = mock_cursor
+
+    database = Database(conn_params={'user': 'unifi'})
+    database.get_config = MagicMock(return_value=True)  # unifi enabled → spgist gate closed
+    monkeypatch.setattr('db.psycopg2.connect', lambda **kw: mock_conn)
+
+    database.ensure_post_boot_indexes()
+
+    executed_sql = ' '.join(str(c) for c in mock_cursor.execute.call_args_list)
+    # The gated SP-GiST index is dropped, never (re)created.
+    assert 'DROP INDEX CONCURRENTLY IF EXISTS idx_logs_spgist_dst_ip_firewall' in executed_sql
+    assert 'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_logs_spgist_dst_ip_firewall' not in executed_sql
 
 
 def test_ensure_post_boot_indexes_warns_on_failure(monkeypatch):
@@ -339,6 +363,7 @@ def test_ensure_post_boot_indexes_continues_after_single_failure(monkeypatch):
     mock_conn.cursor.return_value = mock_cursor
 
     database = Database(conn_params={'user': 'unifi'})
+    database.get_config = MagicMock(return_value=False)  # unifi disabled → spgist gate open
     monkeypatch.setattr('db.psycopg2.connect', lambda **kw: mock_conn)
     mock_logger = MagicMock()
     monkeypatch.setattr(db_module, 'logger', mock_logger)
@@ -406,9 +431,14 @@ def test_post_boot_indexes_all_use_concurrently():
 # ── Post-boot drops (issue #85) ──────────────────────────────────────────────
 
 def test_post_boot_drops_list_has_expected_entries():
-    """_POST_BOOT_DROPS contains the two redundant leftmost-prefix indexes."""
+    """_POST_BOOT_DROPS contains the redundant leftmost-prefix indexes plus the
+    unused low-cardinality single-column indexes removed from _ensure_schema."""
     names = {name for name, _sql in Database._POST_BOOT_DROPS}
-    assert names == {'idx_logs_type', 'idx_logs_rule_action'}
+    assert names == {
+        'idx_logs_type', 'idx_logs_rule_action',
+        'idx_logs_direction', 'idx_logs_src_port', 'idx_logs_dst_port',
+        'idx_logs_protocol', 'idx_logs_service_name',
+    }
 
 
 def test_post_boot_drops_all_use_concurrently_and_if_exists():

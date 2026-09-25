@@ -146,13 +146,14 @@ class Database:
             "CREATE INDEX IF NOT EXISTS idx_logs_timestamp    ON logs (timestamp DESC)",
             "CREATE INDEX IF NOT EXISTS idx_logs_src_ip       ON logs (src_ip)",
             "CREATE INDEX IF NOT EXISTS idx_logs_dst_ip       ON logs (dst_ip)",
-            "CREATE INDEX IF NOT EXISTS idx_logs_direction    ON logs (direction)",
             "CREATE INDEX IF NOT EXISTS idx_logs_threat_score ON logs (threat_score) WHERE threat_score IS NOT NULL",
             "CREATE INDEX IF NOT EXISTS idx_logs_type_time    ON logs (log_type, timestamp DESC)",
             "CREATE INDEX IF NOT EXISTS idx_logs_action_time  ON logs (rule_action, timestamp DESC)",
-            "CREATE INDEX IF NOT EXISTS idx_logs_src_port     ON logs (src_port) WHERE src_port IS NOT NULL",
-            "CREATE INDEX IF NOT EXISTS idx_logs_dst_port     ON logs (dst_port) WHERE dst_port IS NOT NULL",
-            "CREATE INDEX IF NOT EXISTS idx_logs_protocol     ON logs (protocol) WHERE protocol IS NOT NULL",
+            # NOTE: idx_logs_direction / _src_port / _dst_port / _protocol were
+            # removed here — low-cardinality single-column indexes the planner
+            # never chose (idx_scan=0 over days of prod traffic). They only added
+            # INSERT write-amplification. Existing installs drop them via
+            # POST_BOOT_DROPS in db/schema.py.
             # ── Migrations (existing) ─────────────────────────────────────
             # ip_threats persistent cache (added Phase 6)
             """CREATE TABLE IF NOT EXISTS ip_threats (
@@ -178,7 +179,8 @@ class Database:
             "ALTER TABLE ip_threats ADD COLUMN IF NOT EXISTS abuse_is_tor BOOLEAN",
             # IANA service name mapping (after protocol column)
             "ALTER TABLE logs ADD COLUMN IF NOT EXISTS service_name TEXT",
-            "CREATE INDEX IF NOT EXISTS idx_logs_service_name ON logs (service_name) WHERE service_name IS NOT NULL",
+            # idx_logs_service_name removed — unused (idx_scan=0); dropped on
+            # existing installs via POST_BOOT_DROPS in db/schema.py.
             # System configuration table for dynamic settings
             # Must be created before any migration block that may reference it.
             """CREATE TABLE IF NOT EXISTS system_config (
@@ -716,6 +718,20 @@ class Database:
 
         self._backfill_tz_timestamps()
 
+    def _index_condition_met(self, predicate, name):
+        """Evaluate a POST_BOOT_INDEXES 'when' predicate defensively.
+
+        On any error (e.g. a transient config read failure) default to True so a
+        functional index is never silently dropped — the reconcile retries next
+        boot when the condition can be read cleanly.
+        """
+        try:
+            return bool(predicate(self))
+        except Exception:
+            logger.warning("Gate predicate for %s failed — keeping index", name,
+                           exc_info=True)
+            return True
+
     def ensure_post_boot_indexes(self):
         """Create heavyweight indexes and drop redundant ones for existing installs.
 
@@ -742,6 +758,25 @@ class Database:
         try:
             for idx in self._POST_BOOT_INDEXES:
                 try:
+                    when = idx.get('when')
+                    if when is not None and not self._index_condition_met(when, idx['name']):
+                        # Condition not met on this install — index unwanted.
+                        # Drop it if present so a config change (e.g. UniFi
+                        # enabled) reclaims its space + per-INSERT write cost.
+                        # CONCURRENTLY + short lock_timeout so it can't stall boot.
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                "SELECT 1 FROM pg_indexes WHERE indexname = %s",
+                                (idx['name'],),
+                            )
+                            if cur.fetchone():
+                                logger.info("Dropping %s — condition not met (%s)...",
+                                            idx['name'], idx['label'])
+                                cur.execute("SET lock_timeout = '60s'")
+                                cur.execute(
+                                    f"DROP INDEX CONCURRENTLY IF EXISTS {idx['name']}")
+                                logger.info("Index %s dropped (gated off)", idx['name'])
+                        continue
                     with conn.cursor() as cur:
                         cur.execute(
                             "SELECT 1 FROM pg_indexes WHERE indexname = %s",
@@ -754,7 +789,7 @@ class Database:
                         cur.execute(idx['sql'])
                         logger.info("Index %s created successfully", idx['name'])
                 except Exception:
-                    logger.warning("Could not create %s — will retry next boot",
+                    logger.warning("Could not reconcile %s — will retry next boot",
                                    idx['name'], exc_info=True)
 
             # Drop redundant indexes (idempotent via IF EXISTS). Bound by a
