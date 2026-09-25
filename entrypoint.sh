@@ -105,9 +105,9 @@ GEOEOF
     echo "0 7 * * 3,6 uli /app/geoip-update.sh >> /var/log/geoip-update.log 2>&1" > /etc/cron.d/geoipupdate
     chmod 0644 /etc/cron.d/geoipupdate
 
-    # Run an initial update if databases are missing
-    if [ ! -f /app/maxmind/GeoLite2-City.mmdb ]; then
-        echo "[entrypoint] No GeoLite2 databases found, running initial download..."
+    # Run an initial update if either database is missing.
+    if [ ! -f /app/maxmind/GeoLite2-City.mmdb ] || [ ! -f /app/maxmind/GeoLite2-ASN.mmdb ]; then
+        echo "[entrypoint] One or more GeoLite2 databases are missing, running initial download..."
         /app/geoip-update.sh --force
     fi
 
