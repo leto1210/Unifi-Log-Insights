@@ -12,6 +12,7 @@ import logging
 import requests
 
 from db import get_config, get_wan_ips_from_config
+from enrichment import resolve_abuseipdb_enabled
 
 logger = logging.getLogger('blacklist')
 
@@ -40,14 +41,7 @@ class BlacklistFetcher:
         Checked at fetch time (a daily job) so the kill-switch takes effect
         without restarting or signalling the scheduler thread.
         """
-        enabled_env = os.environ.get('ABUSEIPDB_ENABLED', '').strip().lower()
-        if enabled_env in ('true', '1', 'yes'):
-            return True
-        if enabled_env in ('false', '0', 'no'):
-            return False
-        if self.db is not None:
-            return bool(get_config(self.db, 'abuseipdb_enabled', True))
-        return True
+        return resolve_abuseipdb_enabled(self.db)
 
     def fetch_and_store(self):
         """Pull blacklist and upsert into ip_threats. Returns count of IPs stored."""

@@ -7,7 +7,7 @@ import time
 from fastapi import APIRouter, HTTPException
 
 from db import get_config, set_config, get_wan_ips_from_config
-from enrichment import is_public_ip, get_abuseipdb_stats
+from enrichment import is_public_ip, get_abuseipdb_stats, resolve_abuseipdb_enabled
 from deps import abuseipdb, enricher_db, signal_receiver
 
 logger = logging.getLogger('api.abuseipdb')
@@ -20,10 +20,10 @@ def get_abuseipdb_settings():
     """Current AbuseIPDB toggle state. Never returns the API key itself.
 
     ``configured`` reflects whether ``ABUSEIPDB_API_KEY`` is present (env-only);
-    ``enabled`` is the master kill-switch (defaults to true).
+    ``enabled`` is the effective master kill-switch (env > DB > default true).
     """
     return {
-        "enabled": bool(get_config(enricher_db, "abuseipdb_enabled", True)),
+        "enabled": resolve_abuseipdb_enabled(enricher_db),
         "configured": bool(abuseipdb.api_key),
         "active": bool(abuseipdb.enabled),
     }
@@ -39,12 +39,12 @@ def update_abuseipdb_settings(body: dict):
     """
     if "enabled" not in body:
         raise HTTPException(status_code=400, detail="Missing 'enabled' field")
-    enabled = bool(body["enabled"])
-    set_config(enricher_db, "abuseipdb_enabled", enabled)
+    requested_enabled = bool(body["enabled"])
+    set_config(enricher_db, "abuseipdb_enabled", requested_enabled)
     abuseipdb.reload_config()
     signal_receiver()
     return {
-        "enabled": enabled,
+        "enabled": resolve_abuseipdb_enabled(enricher_db),
         "configured": bool(abuseipdb.api_key),
         "active": bool(abuseipdb.enabled),
     }
