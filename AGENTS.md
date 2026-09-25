@@ -4,7 +4,7 @@
 
 `receiver/` contains the Python backend, syslog receiver, parsers, enrichment jobs, API routes, and PostgreSQL access. Keep endpoints in `receiver/routes/`, database logic in `receiver/db/`, services in `receiver/service/`, and UniFi client code in `receiver/unifi/`. Backend tests live in `receiver/tests/`, with performance and MCP smoke subdirectories.
 
-`ui/` is the React/Vite frontend. Put views in `ui/src/components/`, hooks in `ui/src/hooks/`, helpers in `ui/src/lib/`, tests in `ui/src/__tests__/`, and static files in `ui/public/`. Root files define Docker deployment and database initialization. Documentation and screenshots belong in `docs/`. `extension/` is archived; change it only for extension-specific work.
+`ui/` is the React/Vite frontend. Put views in `ui/src/components/`, hooks in `ui/src/hooks/`, helpers in `ui/src/lib/`, tests in `ui/src/__tests__/`, and static files in `ui/public/`. Root files define Docker deployment and database initialization. Documentation and screenshots belong in `docs/`. The browser extension source is no longer in this repo — it lives on the `archive/extension` branch; only `extension/README.md` (a pointer stub) remains on `main`.
 
 ## Build, Test, and Development Commands
 
