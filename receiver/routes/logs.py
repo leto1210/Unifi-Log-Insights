@@ -580,7 +580,7 @@ def export_csv_endpoint(
 
 
 @router.get("/api/services")
-@ttl_cache(ttl=30)
+@ttl_cache(ttl=600)
 def get_services():
     """Return distinct service names for autocomplete filtering."""
     conn = get_conn()
@@ -590,7 +590,7 @@ def get_services():
                 SELECT DISTINCT service_name
                 FROM logs
                 WHERE service_name IS NOT NULL
-                  AND timestamp > now() - interval '36 hours'
+                  AND timestamp > now() - interval '24 hours'
                 ORDER BY service_name
             """)
             services = [row[0] for row in cur.fetchall()]
@@ -605,7 +605,7 @@ def get_services():
 
 
 @router.get("/api/protocols")
-@ttl_cache(ttl=30)
+@ttl_cache(ttl=600)
 def get_protocols():
     """Return distinct protocols seen in logs for dropdown filtering."""
     conn = get_conn()
@@ -615,7 +615,7 @@ def get_protocols():
                 SELECT DISTINCT protocol
                 FROM logs
                 WHERE protocol IS NOT NULL
-                  AND timestamp > now() - interval '36 hours'
+                  AND timestamp > now() - interval '24 hours'
                 ORDER BY protocol
             """)
             protocols = [row[0] for row in cur.fetchall()]
