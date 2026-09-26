@@ -586,6 +586,12 @@ def get_services():
     conn = get_conn()
     try:
         with conn.cursor() as cur:
+            # DISTINCT scan over the 24h window of the large logs table is cheap
+            # when warm (~0.4s) but can exceed the pool's 30s statement_timeout
+            # on a cold buffer cache (e.g. right after a DB restart). Raise the
+            # timeout for this txn only; the 600s TTL cache keeps this to <=6
+            # runs/hour, so the longer ceiling never affects steady-state load.
+            cur.execute("SET LOCAL statement_timeout = '90s'")
             cur.execute("""
                 SELECT DISTINCT service_name
                 FROM logs
@@ -611,6 +617,10 @@ def get_protocols():
     conn = get_conn()
     try:
         with conn.cursor() as cur:
+            # See get_services: raise the per-txn statement_timeout so a cold
+            # DISTINCT scan cannot 500 behind the pool's 30s default. Safe
+            # because the 600s TTL cache limits this to <=6 runs/hour.
+            cur.execute("SET LOCAL statement_timeout = '90s'")
             cur.execute("""
                 SELECT DISTINCT protocol
                 FROM logs
