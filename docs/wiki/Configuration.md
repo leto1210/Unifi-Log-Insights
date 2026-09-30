@@ -67,10 +67,13 @@ this enrollment.
 Self-hosted (UniFi Network Server) controllers use username/password instead of an API key — set them via the Settings UI, no env var equivalent.
 
 When `UNIFI_API_KEY` comes from the environment, set `UNIFI_HOST` there too.
-The key is used only for that configured destination. A saved key or saved
-self-hosted credentials cannot be reused when the controller address changes;
-provide new credentials for the new controller. A connection test never sends
-saved credentials to an address other than the one associated with them.
+The key is used only for that configured destination. This pairing requirement
+applies only to the API-key (UniFi OS) flow — self-hosted username/password
+testing and host changes never read `UNIFI_API_KEY` and are unaffected by it.
+A saved key or saved self-hosted credentials cannot be reused when the
+controller address changes; provide new credentials for the new controller.
+A connection test never sends saved credentials to an address other than the
+one associated with them.
 
 ## GeoIP / Threat intelligence
 
