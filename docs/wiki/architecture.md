@@ -233,7 +233,13 @@ flowchart TD
     REQ["HTTP Request<br>:8090 to :8000"] --> CORS["DualCORSMiddleware<br>Cookie-auth: same-origin<br>Token-auth: permissive"]
     CORS --> AUTH["AuthMiddleware"]
 
-    AUTH --> A1{"Public path?<br>/auth/login, /auth/setup<br>/health"}
+    AUTH --> DISABLED{"AUTH_ENABLED=false?"}
+    DISABLED -- Yes --> ROUTER
+    DISABLED -- No --> BOOT{"First admin exists?"}
+    BOOT -- No --> BOOTPATH{"Bootstrap path?<br>/health, /auth/status,<br>/auth/setup"}
+    BOOTPATH -- Yes --> ROUTER
+    BOOTPATH -- No --> A5
+    BOOT -- Yes --> A1{"Public path?<br>/auth/login, /auth/setup,<br>/auth/status, /setup/status,<br>/health"}
     A1 -- Yes --> ROUTER
     A1 -- No --> A2{"Session cookie<br>or Bearer token?"}
     A2 -- Cookie --> A3["Validate session<br>Check role (admin/viewer)"]

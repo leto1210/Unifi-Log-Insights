@@ -33,6 +33,13 @@ docker logs -f unifi-log-insight
 curl -sf http://localhost:8090/api/health
 ```
 
+If you set `AUTH_ENABLED=true`, enroll the first administrator before opening
+the setup wizard. During that phase the API serves only health, auth status,
+and `/api/auth/setup`; the UI does not yet guide enrollment. The HTTPS and
+`SETUP_TOKEN` procedure is in the [Configuration Reference](Configuration#core).
+For the default internal single-user setup (`AUTH_ENABLED=false`), continue
+directly to the next step.
+
 ## 3. Point the UniFi gateway at the receiver
 
 In the UniFi controller: **Settings > System > Advanced > Remote System Logging**.
