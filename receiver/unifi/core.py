@@ -449,8 +449,13 @@ class UniFiAPI:
                     'error': f'Controller returned error: {status}',
                     'error_code': 'invalid_response'}
         except Exception as e:
+            # Unlike the specific branches above, this catch-all can wrap an
+            # arbitrary library exception whose message may include internal
+            # details (paths, hostnames resolved elsewhere, library internals).
+            # Log it server-side and return a generic message to the client.
+            logger.warning("UniFi connection test failed with an unexpected error: %s", e)
             return {'success': False,
-                    'error': str(e),
+                    'error': 'Connection test failed due to an unexpected error. Check the container logs for details.',
                     'error_code': 'connection_error'}
 
     def _test_unifi_os(self, host, site, verify_ssl, api_key):

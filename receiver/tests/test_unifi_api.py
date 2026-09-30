@@ -403,3 +403,20 @@ class TestInsecureRequestWarningHygiene:
             )
         # Restore the module under the suite's normal filter state.
         importlib.reload(unifi_core)
+
+
+class TestConnectionTestErrorSanitization:
+    """test_connection()'s catch-all must not leak raw exception text."""
+
+    def test_unexpected_exception_returns_generic_message(self, api):
+        """CodeQL: information exposure through an exception (unifi.py#71).
+        The generic except-Exception branch used to return str(e) verbatim
+        to the API caller, which can carry internal details (paths, library
+        internals). It must now return a fixed, generic message instead."""
+        secret_detail = "connection refused by internal-host-10.2.3.4:9999"
+        with patch.object(api, '_test_unifi_os', side_effect=RuntimeError(secret_detail)):
+            result = api.test_connection('https://fake-controller', 'default', True,
+                                          controller_type='unifi_os', api_key='k')
+        assert result['success'] is False
+        assert result['error_code'] == 'connection_error'
+        assert secret_detail not in result['error']
