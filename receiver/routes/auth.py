@@ -221,6 +221,7 @@ def _require_https(request: Request):
 
 
 def _auth_enabled() -> bool:
+    """Report whether authentication is required by this deployment."""
     if not AUTH_ENABLED:
         return False
     enabled = bool(get_config(enricher_db, 'auth_enabled', False))
@@ -231,7 +232,9 @@ def _auth_enabled() -> bool:
         set_config(enricher_db, 'auth_enabled', True)
         logger.info("Auto-enabled auth: AUTH_ENABLED=true and admin user exists in DB")
         return True
-    return enabled
+    # An incomplete installation is protected too. The DB flag is only set
+    # after the first admin is created; it must never open the API meanwhile.
+    return True
 
 
 def _has_users() -> bool:
@@ -439,7 +442,7 @@ def validate_token_with_effective_scopes(token: str) -> dict | None:
         return None
     token_scopes = set(info.get('scopes') or [])
     owner_perms = set(info.get('user_permissions') or [])
-    if info.get('owner_user_id') and owner_perms and '*' not in owner_perms:
+    if info.get('owner_user_id') is not None and '*' not in owner_perms:
         effective = token_scopes & owner_perms
     else:
         effective = token_scopes
@@ -457,6 +460,15 @@ PUBLIC_PATHS = {
     '/api/auth/logout',
     '/api/auth/setup',
     '/api/setup/status',
+}
+
+# During first-admin enrollment, expose only the endpoints required to check
+# health and complete enrollment. In particular, setup/config and token routes
+# cannot be used without an authenticated administrator.
+BOOTSTRAP_PATHS = {
+    '/api/health',
+    '/api/auth/status',
+    '/api/auth/setup',
 }
 
 PUBLIC_PREFIXES = (
@@ -477,10 +489,18 @@ AUTH_SESSION_PATHS = {
 def require_auth(request: Request) -> dict | None:
     """Auth dependency. Returns user/token info or None if auth disabled.
     Raises 401 if auth enabled and no valid credentials."""
-    if not _auth_enabled():
+    if not AUTH_ENABLED:
         return None
 
     path = request.url.path
+    if not _has_admin():
+        if path in BOOTSTRAP_PATHS:
+            return None
+        raise HTTPException(401, "Administrator enrollment required")
+
+    if not _auth_enabled():
+        raise HTTPException(503, "Authentication unavailable")
+
     if path in PUBLIC_PATHS or any(path.startswith(p) for p in PUBLIC_PREFIXES):
         return None
 
