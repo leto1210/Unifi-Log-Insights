@@ -92,6 +92,19 @@ def test_after_admin_requires_authentication(protected_app):
     assert client.get('/api/health').status_code == 200
 
 
+def test_steady_state_skips_admin_existence_query(protected_app, monkeypatch):
+    """Once the DB flag confirms bootstrap is done, require_auth() must not
+    re-run _has_admin()'s JOIN query on every request — only the cold
+    (pre-bootstrap or stale-flag) path may call it."""
+    client, auth, _tokens, state = protected_app
+    state.update(admin=True, users=True, auth_enabled=True)
+    calls = []
+    monkeypatch.setattr(auth, '_has_admin', lambda: (calls.append(1), True)[1])
+    assert client.get('/api/logs').status_code == 401
+    assert client.get('/api/health').status_code == 200
+    assert calls == []
+
+
 def test_viewer_session_remains_read_only(protected_app, monkeypatch):
     """Established viewer sessions read logs but cannot change configuration."""
     client, auth, _tokens, state = protected_app

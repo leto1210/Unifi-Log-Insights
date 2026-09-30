@@ -184,3 +184,50 @@ class TestUniFiTestSeedsIdentity:
         mock_deps.enricher_db.persist_network_identity.assert_called_once()
         kw = mock_deps.enricher_db.persist_network_identity.call_args.kwargs
         assert kw['wan_ip_by_iface'] == {'ppp0': '5.5.5.5'}
+
+    def test_self_hosted_test_ignores_unrelated_env_api_key_guard(
+            self, unifi_test_client, monkeypatch):
+        """A stray UNIFI_API_KEY env var (without UNIFI_HOST) must not block
+        self-hosted username/password testing — that flow never touches
+        UNIFI_API_KEY at all."""
+        client, mock_deps = unifi_test_client
+        monkeypatch.setenv('UNIFI_API_KEY', 'leftover-from-unifi-os-setup')
+        monkeypatch.delenv('UNIFI_HOST', raising=False)
+
+        mock_deps.unifi_api.test_connection.return_value = {
+            'success': True, 'controller_name': 'Controller', 'version': '7.5',
+        }
+        mock_deps.unifi_api.get_network_config.return_value = {
+            'wan_interfaces': [], 'networks': [],
+        }
+
+        resp = client.post('/api/settings/unifi/test', json={
+            'host': 'https://10.0.0.1:8443',
+            'site': 'default',
+            'verify_ssl': False,
+            'controller_type': 'self_hosted',
+            'username': 'admin',
+            'password': 'secret',
+        })
+
+        assert resp.status_code == 200
+        assert resp.json()['success'] is True
+
+    def test_unifi_os_test_still_requires_env_host_with_env_key(
+            self, unifi_test_client, monkeypatch):
+        """The UNIFI_HOST/UNIFI_API_KEY pairing guard must still apply to the
+        api_key (unifi_os) flow it was written for."""
+        client, mock_deps = unifi_test_client
+        monkeypatch.setenv('UNIFI_API_KEY', 'some-api-key')
+        monkeypatch.delenv('UNIFI_HOST', raising=False)
+
+        resp = client.post('/api/settings/unifi/test', json={
+            'host': 'https://192.168.1.1',
+            'site': 'default',
+            'verify_ssl': False,
+            'controller_type': 'unifi_os',
+            'api_key': 'test-key',
+        })
+
+        assert resp.status_code == 400
+        assert 'UNIFI_HOST is required' in resp.json()['detail']

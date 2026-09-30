@@ -493,13 +493,21 @@ def require_auth(request: Request) -> dict | None:
         return None
 
     path = request.url.path
-    if not _has_admin():
-        if path in BOOTSTRAP_PATHS:
-            return None
-        raise HTTPException(401, "Administrator enrollment required")
-
-    if not _auth_enabled():
-        raise HTTPException(503, "Authentication unavailable")
+    # Fast path: once bootstrap has completed the DB flag is set, so steady
+    # -state requests pay for one config read here (same as pre-bootstrap
+    # code) instead of also running _has_admin()'s JOIN query on every
+    # request. The admin-existence check only runs on the rare cold path
+    # below (first boot, or a DB flag that hasn't caught up yet).
+    if not bool(get_config(enricher_db, 'auth_enabled', False)):
+        if not _has_admin():
+            if path in BOOTSTRAP_PATHS:
+                return None
+            raise HTTPException(401, "Administrator enrollment required")
+        # Admin exists but the DB flag is stale (e.g. toggled off then on,
+        # or this is the first request after enrollment) — sync it so this
+        # cold path isn't repeated on every subsequent request.
+        set_config(enricher_db, 'auth_enabled', True)
+        logger.info("Auto-enabled auth: AUTH_ENABLED=true and admin user exists in DB")
 
     if path in PUBLIC_PATHS or any(path.startswith(p) for p in PUBLIC_PREFIXES):
         return None

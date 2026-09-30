@@ -114,6 +114,21 @@ def test_unifi_put_host_change_requires_new_credentials(unifi_route):
     deps.unifi_api.reload_config.assert_not_called()
 
 
+def test_unifi_put_self_hosted_host_change_ignores_unrelated_env_key(
+        unifi_route, monkeypatch):
+    """A stray UNIFI_API_KEY env var (without UNIFI_HOST) must not block a
+    self-hosted host change that supplies valid username/password — that
+    path never reads UNIFI_API_KEY at all."""
+    route, deps, db = unifi_route
+    monkeypatch.setenv('UNIFI_API_KEY', 'leftover-from-unifi-os-setup')
+    monkeypatch.delenv('UNIFI_HOST', raising=False)
+    route.update_unifi_settings({
+        'host': 'https://other.lan', 'controller_type': 'self_hosted',
+        'username': 'admin', 'password': 'secret',
+    })
+    deps.unifi_api.reload_config.assert_called_once()
+
+
 def test_unifi_saved_self_hosted_credentials_cannot_move(unifi_route):
     """The self hosted login path has the same destination binding."""
     route, deps, _ = unifi_route

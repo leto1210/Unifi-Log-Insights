@@ -99,7 +99,8 @@ def _update_unifi_settings_locked(body: dict):
                 new_credentials = bool(body.get('username') and body.get('password'))
             else:
                 new_credentials = bool(body.get('api_key')) and not os.environ.get('UNIFI_API_KEY')
-            if not new_credentials or (os.environ.get('UNIFI_API_KEY') and
+            if not new_credentials or (controller_type != 'self_hosted' and
+                                        os.environ.get('UNIFI_API_KEY') and
                                         not os.environ.get('UNIFI_HOST')):
                 raise HTTPException(400, 'New credentials are required when changing the UniFi host')
         body = {**body, 'host': new_host}
@@ -164,8 +165,6 @@ def test_unifi_connection(body: dict):
 
 def _test_unifi_connection_locked(body: dict):
     """Test and save a destination-bound credential under the client lock."""
-    if os.environ.get('UNIFI_API_KEY') and not os.environ.get('UNIFI_HOST'):
-        raise HTTPException(400, 'UNIFI_HOST is required with UNIFI_API_KEY')
     try:
         host = normalize_integration_base_url(body.get('host', ''))
     except ValueError:
@@ -176,6 +175,12 @@ def _test_unifi_connection_locked(body: dict):
     use_env_key = body.get('use_env_key', False)
     use_saved_key = body.get('use_saved_key', False)
     use_saved_credentials = body.get('use_saved_credentials', False)
+
+    # Self-hosted controllers authenticate with username/password and never
+    # touch UNIFI_API_KEY, so an unrelated env var split must not block them.
+    if (controller_type != 'self_hosted' and os.environ.get('UNIFI_API_KEY')
+            and not os.environ.get('UNIFI_HOST')):
+        raise HTTPException(400, 'UNIFI_HOST is required with UNIFI_API_KEY')
 
     if use_env_key or use_saved_key or use_saved_credentials:
         bound_host = (os.environ.get('UNIFI_HOST', '') if use_env_key else
