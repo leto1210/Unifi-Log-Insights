@@ -18,6 +18,7 @@ import urllib3
 from requests.exceptions import ConnectionError, Timeout, SSLError
 
 from db import encrypt_api_key, decrypt_api_key
+from service.integration_urls import same_integration_destination
 
 from .exceptions import UniFiPermissionError
 
@@ -74,6 +75,7 @@ class UniFiAPI:
         self._poll_thread = None
         self._poll_stop = threading.Event()
         self._lifecycle_lock = threading.RLock()
+        self._config_lock = threading.RLock()
         self._lock = threading.Lock()
         self._ip_to_name = {}
         self._mac_to_name = {}
@@ -90,10 +92,35 @@ class UniFiAPI:
 
     def _resolve_config(self):
         """Load settings: env var > system_config DB > default."""
-        self.host = (os.environ.get('UNIFI_HOST') or
-                     self._db.get_config('unifi_host', '')).rstrip('/')
-        self.api_key = (os.environ.get('UNIFI_API_KEY') or
-                        self._decrypt_db_key())
+        db_host = self._db.get_config('unifi_host', '')
+        self.host = (os.environ.get('UNIFI_HOST') or db_host).rstrip('/')
+        saved_key_host = self._db.get_config('unifi_api_key_host', '')
+        if not saved_key_host and db_host and self._db.get_config('unifi_api_key', ''):
+            try:
+                self._db.set_config('unifi_api_key_host', db_host)
+                saved_key_host = db_host
+            except Exception:
+                logger.warning('Could not bind legacy UniFi API key to its host')
+        saved_credentials_host = self._db.get_config('unifi_credentials_host', '')
+        if (not saved_credentials_host and db_host and
+                (self._db.get_config('unifi_username', '') or
+                 self._db.get_config('unifi_password', ''))):
+            try:
+                self._db.set_config('unifi_credentials_host', db_host)
+                saved_credentials_host = db_host
+            except Exception:
+                logger.warning('Could not bind legacy UniFi login to its host')
+        def matches(bound_host):
+            """Keep a saved credential bound to its configured destination."""
+            try:
+                return bool(bound_host) and same_integration_destination(self.host, bound_host)
+            except ValueError:
+                return False
+
+        env_key = os.environ.get('UNIFI_API_KEY')
+        self.api_key = ((env_key if os.environ.get('UNIFI_HOST') else '')
+                        if env_key else
+                        (self._decrypt_db_key() if matches(saved_key_host) else ''))
         self.site = (os.environ.get('UNIFI_SITE') or
                      self._db.get_config('unifi_site', 'default'))
 
@@ -115,8 +142,10 @@ class UniFiAPI:
 
         # Self-hosted controller config (DB only — no env vars)
         self._controller_type = self._db.get_config('unifi_controller_type', 'unifi_os')
-        self._username = self._decrypt_db_credential('unifi_username')
-        self._password = self._decrypt_db_credential('unifi_password')
+        self._username = (self._decrypt_db_credential('unifi_username')
+                          if matches(saved_credentials_host) else '')
+        self._password = (self._decrypt_db_credential('unifi_password')
+                          if matches(saved_credentials_host) else '')
         self._site_id = self._db.get_config('unifi_site_id', None)
 
         # Force-disable firewall management for self-hosted (integration API not available)
@@ -172,6 +201,13 @@ class UniFiAPI:
 
     def reload_config(self):
         """Re-read settings, invalidate session + site UUID, restart polling if needed."""
+        with self._config_lock:
+            was_polling = self._reload_config_locked()
+        if was_polling or self.enabled:
+            self.start_polling()
+
+    def _reload_config_locked(self):
+        """Reload configuration while outbound requests are excluded."""
         was_polling = self._poll_thread is not None and self._poll_thread.is_alive()
         self._session = None
         self._site_uuid = None
@@ -179,8 +215,7 @@ class UniFiAPI:
         self._resolve_config()
         logger.info("UniFi API config reloaded (enabled=%s, host=%s)", self.enabled, self.host or '(none)')
         # Restart polling if it was running (or start it if newly enabled)
-        if was_polling or self.enabled:
-            self.start_polling()
+        return was_polling
 
     _ENV_MAP = {
         'host': 'UNIFI_HOST',
@@ -204,6 +239,7 @@ class UniFiAPI:
                     self.host, self._username, self._password, self.verify_ssl)
             else:
                 self._session = requests.Session()
+                self._session.max_redirects = 0
                 self._session.headers['X-API-KEY'] = self.api_key
                 self._session.verify = self.verify_ssl
         return self._session
@@ -211,6 +247,7 @@ class UniFiAPI:
     def _make_session(self, api_key: str, verify_ssl: bool):
         """Create a temporary session for test_connection."""
         s = requests.Session()
+        s.max_redirects = 0
         s.headers['X-API-KEY'] = api_key
         s.verify = verify_ssl
         return s
@@ -229,6 +266,7 @@ class UniFiAPI:
     def _login_session(self, host, username, password, verify_ssl):
         """Cookie-based login for self-hosted controllers."""
         session = requests.Session()
+        session.max_redirects = 0
         session.verify = verify_ssl
         resp = session.post(f"{host}/api/login", json={
             "username": username,
@@ -264,6 +302,13 @@ class UniFiAPI:
 
     def _get(self, path, host=None, session=None):
         """GET from classic API."""
+        with self._config_lock:
+            return self._get_locked(path, host=host, session=session)
+
+    def _get_locked(self, path, host=None, session=None):
+        """Perform a classic API GET under the configuration lock."""
+        if host is not None and session is None and not same_integration_destination(host, self.host):
+            raise ValueError('A saved UniFi session cannot target another host')
         h = host or self.host
         s = session or self._get_session()
         url = self._build_url(path, host=h)
@@ -281,6 +326,13 @@ class UniFiAPI:
 
     def _get_integration(self, path, host=None, session=None):
         """GET from integration API (no site prefix)."""
+        with self._config_lock:
+            return self._get_integration_locked(path, host=host, session=session)
+
+    def _get_integration_locked(self, path, host=None, session=None):
+        """Perform an integration API GET under the configuration lock."""
+        if host is not None and session is None and not same_integration_destination(host, self.host):
+            raise ValueError('A saved UniFi session cannot target another host')
         if self._controller_type == 'self_hosted':
             raise NotImplementedError("Integration API not available on self-hosted controllers")
         h = host or self.host
@@ -293,6 +345,11 @@ class UniFiAPI:
 
     def _get_integration_site(self, path):
         """GET from integration API with site UUID prefix."""
+        with self._config_lock:
+            return self._get_integration_site_locked(path)
+
+    def _get_integration_site_locked(self, path):
+        """Perform a site GET under the configuration lock."""
         if self._controller_type == 'self_hosted':
             raise NotImplementedError("Integration API not available on self-hosted controllers")
         if not self._site_uuid:
@@ -305,6 +362,11 @@ class UniFiAPI:
 
     def _patch_integration_site(self, path, body):
         """PATCH to integration API with site UUID prefix."""
+        with self._config_lock:
+            return self._patch_integration_site_locked(path, body)
+
+    def _patch_integration_site_locked(self, path, body):
+        """Perform a site PATCH under the configuration lock."""
         if self._controller_type == 'self_hosted':
             raise NotImplementedError("Integration API not available on self-hosted controllers")
         if not self._site_uuid:
