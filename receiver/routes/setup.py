@@ -10,7 +10,7 @@ from typing import Optional
 from fastapi import APIRouter, HTTPException, Request
 from psycopg2.extras import RealDictCursor, Json
 
-from db import Database, get_config, set_config, count_logs, encrypt_api_key, decrypt_api_key, parse_retention_time
+from db import Database, get_config, set_config, encrypt_api_key, decrypt_api_key, parse_retention_time
 from deps import get_conn, put_conn, enricher_db, unifi_api, signal_receiver, APP_VERSION, ttl_cache
 from unifi_api import UniFiAPI
 from firewall_policy_matcher import invalidate_cache as invalidate_fw_cache
@@ -19,6 +19,7 @@ from parsers import (
     VPN_BADGE_LABELS, VPN_PREFIX_DESCRIPTIONS,
 )
 from query_helpers import validate_view_filters
+from service.integration_urls import normalize_integration_base_url, same_integration_destination
 
 logger = logging.getLogger('api.setup')
 
@@ -80,10 +81,9 @@ def get_current_config():
 
 @router.get("/api/setup/status")
 def setup_status():
-    """Check if setup wizard is complete."""
+    """Report setup completion without scanning the logs table."""
     return {
         "setup_complete": get_config(enricher_db, "setup_complete", False),
-        "logs_count": count_logs(enricher_db, 'firewall'),
     }
 
 
@@ -486,10 +486,21 @@ def export_config(request: Request, include_api_key: bool = False):
                 raise HTTPException(403, "Admin role required to export API key")
         
         # Authorization passed — decrypt and include the API key
-        encrypted = get_config(enricher_db, _API_KEY_CONFIG_KEY, '')
+        # Read the secret and its destination in one MVCC snapshot. A concurrent
+        # config import must not produce a backup with a mixed key/host pair.
+        saved_key = enricher_db.get_config_many((_API_KEY_CONFIG_KEY, 'unifi_api_key_host'))
+        encrypted = saved_key.get(_API_KEY_CONFIG_KEY, '')
         if encrypted:
             decrypted = decrypt_api_key(encrypted)
             if decrypted:
+                bound_host = saved_key.get('unifi_api_key_host', '')
+                try:
+                    normalize_integration_base_url(bound_host)
+                except (TypeError, ValueError):
+                    raise HTTPException(409, 'UniFi API key has no valid bound host') from None
+                # A DB host may differ from UNIFI_HOST. Backups containing a
+                # key must restore its bound destination, not that stale host.
+                config['unifi_host'] = bound_host
                 config[_API_KEY_CONFIG_KEY] = decrypted
                 includes_api_key = True
 
@@ -530,8 +541,28 @@ def import_config(body: dict):
 
     imported_keys = []
     failed_keys = []
+    # Legacy saved keys may have no destination binding yet. Preserve their
+    # original host before importing a different one; otherwise reload_config()
+    # could bind the old key to the newly imported host.
+    host_change_blocked = False
+    if ('unifi_host' in config and
+            get_config(enricher_db, _API_KEY_CONFIG_KEY, '')):
+        old_host = get_config(enricher_db, 'unifi_host', '')
+        if not get_config(enricher_db, 'unifi_api_key_host', ''):
+            if old_host:
+                set_config(enricher_db, 'unifi_api_key_host', old_host)
+            else:
+                host_change_blocked = True
+    # A legacy key with no known old host can only be replaced as a complete
+    # key+host pair. Defer the host write until the new key is stored.
+    deferred_host = (config['unifi_host'] if host_change_blocked and
+                     config.get(_API_KEY_CONFIG_KEY) else None)
     for key in _EXPORTABLE_KEYS:
         if key not in config:
+            continue
+        if key == 'unifi_host' and host_change_blocked:
+            if deferred_host is None:
+                failed_keys.append(key)
             continue
         val = config[key]
         # Validate MCP-specific keys before storing
@@ -589,13 +620,36 @@ def import_config(body: dict):
 
     # Handle API key separately — re-encrypt for storage
     if _API_KEY_CONFIG_KEY in config and config[_API_KEY_CONFIG_KEY]:
+        env_host = os.environ.get('UNIFI_HOST')
+        key_host = env_host or deferred_host or get_config(enricher_db, 'unifi_host', '')
         try:
-            encrypted = encrypt_api_key(config[_API_KEY_CONFIG_KEY])
-            set_config(enricher_db, _API_KEY_CONFIG_KEY, encrypted)
-            imported_keys.append(_API_KEY_CONFIG_KEY)
-        except Exception as e:
-            logger.warning("Failed to encrypt imported API key: %s", e)
+            # Reject a backup for a different controller when the environment
+            # overrides its host. The imported key must follow the effective
+            # destination, never a stale DB host.
+            normalize_integration_base_url(key_host)
+            if env_host and ('unifi_host' in imported_keys or deferred_host is not None):
+                if not same_integration_destination(env_host, config['unifi_host']):
+                    raise ValueError('Imported host differs from UNIFI_HOST')
+        except (TypeError, ValueError):
             failed_keys.append(_API_KEY_CONFIG_KEY)
+            if deferred_host is not None:
+                failed_keys.append('unifi_host')
+        else:
+            try:
+                encrypted = encrypt_api_key(config[_API_KEY_CONFIG_KEY])
+                updates = {_API_KEY_CONFIG_KEY: encrypted,
+                           'unifi_api_key_host': key_host}
+                if deferred_host is not None:
+                    updates['unifi_host'] = deferred_host
+                enricher_db.set_config_many(updates)
+                imported_keys.append(_API_KEY_CONFIG_KEY)
+                if deferred_host is not None:
+                    imported_keys.append('unifi_host')
+            except Exception as e:
+                logger.warning("Failed to encrypt imported API key: %s", e)
+                failed_keys.append(_API_KEY_CONFIG_KEY)
+                if deferred_host is not None:
+                    failed_keys.append('unifi_host')
 
     # Import saved views (if present)
     failed_saved_views = []

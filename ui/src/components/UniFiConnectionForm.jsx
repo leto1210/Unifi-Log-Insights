@@ -30,6 +30,12 @@ export default function UniFiConnectionForm({
   const timeoutRef = useRef(null)
 
   const isSelfHosted = controllerType === 'self_hosted'
+  const hostChanged = !!savedHost &&
+    normalizeHost(host).replace(/\/+$/, '').toLowerCase() !==
+    normalizeHost(savedHost).replace(/\/+$/, '').toLowerCase()
+  const envHostMismatch = !!(envApiKey && envHost) &&
+    normalizeHost(host).replace(/\/+$/, '').toLowerCase() !==
+    normalizeHost(envHost).replace(/\/+$/, '').toLowerCase()
 
   // Cleanup timeout on unmount
   useEffect(() => {
@@ -39,8 +45,8 @@ export default function UniFiConnectionForm({
   }, [])
 
   const hasCredentials = isSelfHosted
-    ? useSavedCredentials || (username.trim() && password.trim())
-    : envApiKey || useSaved || apiKey.trim()
+    ? (useSavedCredentials && !hostChanged) || (username.trim() && password.trim())
+    : !envHostMismatch && ((envApiKey && !!envHost) || (useSaved && !hostChanged) || apiKey.trim())
 
   const handleTypeChange = (type) => {
     setControllerType(type)
@@ -66,16 +72,16 @@ export default function UniFiConnectionForm({
       }
 
       if (isSelfHosted) {
-        if (useSavedCredentials) {
+        if (useSavedCredentials && !hostChanged) {
           params.use_saved_credentials = true
         } else {
           params.username = username.trim()
           params.password = password
         }
       } else {
-        if (envApiKey) {
+        if (envApiKey && envHost && !envHostMismatch) {
           params.use_env_key = true
-        } else if (useSaved) {
+        } else if (useSaved && !hostChanged) {
           params.use_saved_key = true
         } else {
           params.api_key = apiKey.trim()
@@ -92,7 +98,7 @@ export default function UniFiConnectionForm({
             host: normalizedHost,
             site,
             verify_ssl: verifySsl,
-            use_env_key: !!envApiKey,
+            use_env_key: !!(envApiKey && envHost && !envHostMismatch),
             controller_type: controllerType,
             controller_name: res.controller_name,
             version: res.version,
@@ -160,6 +166,14 @@ export default function UniFiConnectionForm({
           }
         </div>
       )}
+      {envApiKey && !envHost && !isSelfHosted && (
+        <p className="mb-4 text-sm text-amber-400" role="alert">
+          UNIFI_HOST is required with UNIFI_API_KEY. Set both environment variables and restart the container.
+        </p>
+      )}
+      {envHostMismatch && !isSelfHosted && (
+        <p className="mb-4 text-sm text-amber-400" role="alert">The API key is bound to UNIFI_HOST. Reload after changing the environment host.</p>
+      )}
 
       <div className="space-y-3 p-4 rounded-lg border border-gray-700 bg-gray-950">
         <div>
@@ -187,11 +201,16 @@ export default function UniFiConnectionForm({
             </p>
           )}
         </div>
+        {hostChanged && !envHost && (
+          <p className="text-sm text-amber-400" role="alert">
+            This is a different UniFi host. Enter new credentials before testing the connection.
+          </p>
+        )}
 
         {/* Credential fields — conditional on controller type */}
         {isSelfHosted ? (
           <div className="space-y-3">
-            {useSavedCredentials ? (
+            {useSavedCredentials && !hostChanged ? (
               <div>
                 <label className="block text-base text-gray-200 font-medium mb-1">Credentials</label>
                 <div className="flex items-center gap-2">
@@ -230,7 +249,7 @@ export default function UniFiConnectionForm({
                     className="w-full px-3 py-2 rounded bg-black border border-gray-600 text-sm text-gray-200 placeholder-gray-500 focus:border-teal-500 focus:outline-none focus:ring-2 focus:ring-teal-500/20"
                   />
                 </div>
-                {savedUsername && !username.trim() && (
+                {savedUsername && !hostChanged && !username.trim() && (
                   <button
                     onClick={() => { setUseSavedCredentials(true); setResult(null); setError(null) }}
                     className="text-sm text-blue-400 hover:text-blue-300"
@@ -247,7 +266,7 @@ export default function UniFiConnectionForm({
         ) : !envApiKey ? (
           <div>
             <label className="block text-base text-gray-200 font-medium mb-1">API Key</label>
-            {useSaved ? (
+            {useSaved && !hostChanged ? (
               <div className="flex items-center gap-2">
                 <div className="flex-1 px-3 py-2 rounded bg-black border border-gray-600 text-sm text-gray-400">
                   &#x2022;&#x2022;&#x2022;&#x2022;&#x2022;&#x2022;&#x2022;&#x2022; (saved)
@@ -268,7 +287,7 @@ export default function UniFiConnectionForm({
                   placeholder="Enter your UniFi API key"
                   className="w-full px-3 py-2 rounded bg-black border border-gray-600 text-sm text-gray-200 placeholder-gray-500 focus:border-teal-500 focus:outline-none focus:ring-2 focus:ring-teal-500/20"
                 />
-                {savedApiKey && !apiKey.trim() && (
+                {savedApiKey && !hostChanged && !apiKey.trim() && (
                   <button
                     onClick={() => { setUseSaved(true); setResult(null); setError(null) }}
                     className="text-sm text-blue-400 hover:text-blue-300 mt-1"

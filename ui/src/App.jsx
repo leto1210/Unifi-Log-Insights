@@ -13,6 +13,7 @@ import Login from './components/Login'
 import { fetchHealth, fetchConfig, fetchLatestRelease, dismissUpgradeModal, dismissVpnToast, fetchInterfaces, fetchUiSettings, updateUiSettings, fetchUniFiSettings, fetchAuthStatus, fetchAuthMe, authLogout, setAuthExpiredHandler } from './api'
 import { loadInterfaceLabels } from './utils'
 import { isVpnInterface } from './vpnUtils'
+import { clearSessionCache } from './lib/sessionCache'
 
 function LoadingSplash() {
   return (
@@ -153,8 +154,58 @@ export default function App() {
   const [logsPaused, setLogsPaused] = useState(false)
   const onLogsPauseChange = useCallback((paused) => setLogsPaused(paused), [])
   const [uiSettings, setUiSettings] = useState(null)
-  const [authState, setAuthState] = useState('loading') // 'loading', 'login', 'authenticated', 'none'
+  const [authState, setAuthState] = useState('loading') // 'loading', 'setup', 'admin-missing', 'login', 'authenticated', 'none'
   const [authStatus, setAuthStatus] = useState(null) // response from /api/auth/status
+  const [logoutError, setLogoutError] = useState('')
+  const [loggingOut, setLoggingOut] = useState(false)
+
+  const clearPrivateState = () => {
+    clearSessionCache()
+    sessionStorage.removeItem('uli_identity')
+    loadInterfaceLabels({})
+    setConfig(null)
+    setConfigLoaded(false)
+    setUiSettings(null)
+    setHealth(null)
+    setLogsDrill(null)
+    setDrillSource(null)
+    setMapFlyTo(null)
+    setAllInterfaces(null)
+    setUnlabeledVpn([])
+    setShowVpnToast(false)
+    setShowUnifiToast(false)
+    setShowSettings(false)
+    setShowWizard(false)
+  }
+
+  const rememberIdentity = (me) => {
+    const identity = String(me?.user_id ?? me?.username ?? 'anonymous')
+    if (sessionStorage.getItem('uli_identity') !== identity) clearPrivateState()
+    sessionStorage.setItem('uli_identity', identity)
+  }
+
+  const handleAuthSuccess = async () => {
+    // Login and first-admin setup both create a new session. Fetch the stable
+    // user ID before allowing cached data from a previous account to render.
+    try { rememberIdentity(await fetchAuthMe()) }
+    catch { clearPrivateState() }
+    bootstrapDoneRef.current = true
+    setAuthState('authenticated')
+  }
+
+  const handleLogout = async () => {
+    setLogoutError('')
+    setLoggingOut(true)
+    try {
+      await authLogout()
+      clearPrivateState()
+      setAuthState('login')
+    } catch (err) {
+      setLogoutError(err.message || 'Sign out failed. Please retry.')
+    } finally {
+      setLoggingOut(false)
+    }
+  }
 
   // Persist URL-derived theme to localStorage so Settings reads the correct value
   useEffect(() => {
@@ -166,7 +217,7 @@ export default function App() {
 
   // Fetch UI settings after auth resolves (avoids 401 when auth is enabled)
   useEffect(() => {
-    if (authState === 'loading' || authState === 'login') return
+    if (authState === 'loading' || authState === 'login' || authState === 'setup' || authState === 'admin-missing') return
     fetchUiSettings().then(data => {
       setUiSettings(data)
       if (!localStorage.getItem('ui_theme') && data.ui_theme && data.ui_theme !== initialThemeRef.current) {
@@ -252,7 +303,10 @@ export default function App() {
     // Otherwise, early 401s from parallel API calls (fetchConfig, fetchHealth, etc.)
     // would prematurely flip to the login screen before authStatus is set.
     setAuthExpiredHandler(() => {
-      if (mounted && bootstrapDoneRef.current) setAuthState('login')
+      if (mounted && bootstrapDoneRef.current) {
+        clearPrivateState()
+        setAuthState('login')
+      }
     })
 
     fetchAuthStatus()
@@ -260,13 +314,15 @@ export default function App() {
         if (!mounted) return
         setAuthStatus(status)
 
-        // Setup wizard takes priority
-        if (status.setup_complete === false) {
-          setAuthState('none')
+        // With authentication enabled, the first administrator must be
+        // enrolled before the setup wizard can call protected APIs.
+        if (status.auth_enabled_effective && !status.has_admin) {
+          setAuthState(status.has_users ? 'admin-missing' : 'setup')
           return
         }
 
         if (!status.auth_enabled_effective) {
+          rememberIdentity(null)
           setAuthState('none')
           return
         }
@@ -275,6 +331,7 @@ export default function App() {
         try {
           const me = await fetchAuthMe()
           if (me.authenticated) {
+            rememberIdentity(me)
             bootstrapDoneRef.current = true
             setAuthState('authenticated')
             // Warn if reverse proxy isn't sending X-ULI-Proxy-Auth
@@ -302,7 +359,7 @@ export default function App() {
 
   // Load config + interface labels after auth resolves
   useEffect(() => {
-    if (authState === 'loading' || authState === 'login') return
+    if (authState === 'loading' || authState === 'login' || authState === 'setup' || authState === 'admin-missing') return
     let mounted = true
     fetchConfig()
       .then(cfg => {
@@ -370,7 +427,7 @@ export default function App() {
 
   // Detect unlabeled VPN interfaces and show toast (polls every 5 min)
   useEffect(() => {
-    if (authState === 'loading' || authState === 'login') return
+    if (authState === 'loading' || authState === 'login' || authState === 'setup' || authState === 'admin-missing') return
     if (!config || !configLoaded) return
 
     const checkVpn = () => {
@@ -402,7 +459,7 @@ export default function App() {
 
   // Check UniFi controller connection status and show toast if disconnected
   useEffect(() => {
-    if (authState === 'loading' || authState === 'login') return
+    if (authState === 'loading' || authState === 'login' || authState === 'setup' || authState === 'admin-missing') return
     if (!config || !configLoaded) return
     if (!config.unifi_enabled) return
     const dismissed = sessionStorage.getItem('unifi_toast_dismissed')
@@ -510,15 +567,28 @@ export default function App() {
     return <LoadingSplash />
   }
 
-  if (authState === 'login') {
+  if (authState === 'admin-missing') {
+    return (
+      <div className="flex min-h-dvh items-center justify-center bg-gray-950 px-4 text-gray-200">
+        <div className="max-w-lg rounded-xl border border-amber-500/30 bg-gray-900 p-6">
+          <h1 className="text-xl font-semibold">Administrator recovery required</h1>
+          <p className="mt-3 text-sm text-gray-300">Users already exist, but no active administrator remains. Restore an administrator through a local database backup or controlled maintenance before signing in.</p>
+          <a className="mt-3 inline-block text-sm text-teal-400 underline" href="https://github.com/leto1210/Unifi-Log-Insights/wiki/Configuration">See the Configuration documentation</a>
+        </div>
+      </div>
+    )
+  }
+
+  if (authState === 'login' || authState === 'setup') {
     return (
       <Login
+        setupMode={authState === 'setup'}
         isHttps={authStatus?.is_https}
         proxyTrusted={authStatus?.proxy_trusted}
         isEmbedded={isEmbedded}
         theme={theme}
         version={health?.version}
-        onSuccess={() => setAuthState('authenticated')}
+        onSuccess={handleAuthSuccess}
       />
     )
   }
@@ -834,15 +904,19 @@ export default function App() {
             )}
           </button>
           {authState === 'authenticated' && (
-            <button
-              onClick={() => { authLogout().catch(() => { /* intentional: always proceed to login screen even if server unreachable */ }); setAuthState('login') }}
-              className="p-1.5 rounded hover:bg-gray-800 text-gray-400 hover:text-gray-200 transition-colors"
-              title="Sign Out"
-            >
-              <svg className="w-4 h-4" viewBox="0 0 20 20" fill="currentColor">
-                <path fillRule="evenodd" d="M3 3a1 1 0 00-1 1v12a1 1 0 102 0V4a1 1 0 00-1-1zm10.293 9.293a1 1 0 001.414 1.414l3-3a1 1 0 000-1.414l-3-3a1 1 0 10-1.414 1.414L14.586 9H7a1 1 0 100 2h7.586l-1.293 1.293z" clipRule="evenodd" />
-              </svg>
-            </button>
+            <div className="flex items-center gap-2">
+              {logoutError && <span role="alert" className="text-xs text-red-400">{logoutError}</span>}
+              <button
+                onClick={handleLogout}
+                disabled={loggingOut}
+                className="p-1.5 rounded hover:bg-gray-800 text-gray-400 hover:text-gray-200 transition-colors disabled:opacity-50"
+                title={logoutError ? 'Retry Sign Out' : 'Sign Out'}
+              >
+                <svg className="w-4 h-4" viewBox="0 0 20 20" fill="currentColor">
+                  <path fillRule="evenodd" d="M3 3a1 1 0 00-1 1v12a1 1 0 102 0V4a1 1 0 00-1-1zm10.293 9.293a1 1 0 001.414 1.414l3-3a1 1 0 000-1.414l-3-3a1 1 0 10-1.414 1.414L14.586 9H7a1 1 0 100 2h7.586l-1.293 1.293z" clipRule="evenodd" />
+                </svg>
+              </button>
+            </div>
           )}
           <button
             onClick={() => setShowSettings(true)}

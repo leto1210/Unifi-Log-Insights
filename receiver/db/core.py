@@ -1794,6 +1794,14 @@ class Database:
                 row = cur.fetchone()
                 return row[0] if row else default
 
+    def get_config_many(self, keys: tuple[str, ...]) -> dict[str, object]:
+        """Read related config entries from one database snapshot."""
+        with self.get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT key, value FROM system_config WHERE key = ANY(%s)",
+                            [list(keys)])
+                return dict(cur.fetchall())
+
     def set_config(self, key: str, value):
         """Upsert a config value to system_config table.
 
@@ -1807,6 +1815,18 @@ class Database:
                     ON CONFLICT (key) DO UPDATE
                     SET value = EXCLUDED.value, updated_at = NOW()
                 """, [key, Json(value)])  # Use Json() for proper JSONB handling
+
+    def set_config_many(self, values: dict[str, object]):
+        """Upsert related config entries in one transaction."""
+        with self.get_conn() as conn:
+            with conn.cursor() as cur:
+                for key, value in values.items():
+                    cur.execute("""
+                        INSERT INTO system_config (key, value, updated_at)
+                        VALUES (%s, %s, NOW())
+                        ON CONFLICT (key) DO UPDATE
+                        SET value = EXCLUDED.value, updated_at = NOW()
+                    """, [key, Json(value)])
 
 
     # ── rDNS cache (issue #98) ───────────────────────────────────────────────

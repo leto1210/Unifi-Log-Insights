@@ -536,11 +536,8 @@ def require_auth(request: Request) -> dict | None:
 @router.get("/api/auth/status")
 def auth_status(request: Request):
     """Public bootstrap endpoint for SPA."""
-    # Read `setup_complete` straight from system_config instead of calling
-    # routes.setup.setup_status(), which also runs a COUNT(*) over the 42 M-row
-    # `logs` table for its `logs_count` field. This endpoint fires on every SPA
-    # page load and never uses logs_count, so that COUNT was ~1 s of wasted work
-    # on each call — see setup_status() for the full (wizard-only) payload.
+    # Read `setup_complete` straight from system_config. Both this endpoint
+    # and /api/setup/status avoid counting the large logs table on page load.
     auth_enabled = _auth_enabled()
     result = {
         "auth_enabled_effective": auth_enabled,

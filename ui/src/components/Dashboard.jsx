@@ -268,6 +268,8 @@ export default function Dashboard({ maxFilterDays }) {
   const [tierStatus, setTierStatus] = useState({ overview: 'loading', charts: 'loading', tables: 'loading' })
   const requestEpochRef = useRef(0)
 
+  useEffect(() => () => { requestEpochRef.current++ }, [])
+
   const loadTiers = useCallback((tr, isRefresh = false) => {
     const epoch = ++requestEpochRef.current
 

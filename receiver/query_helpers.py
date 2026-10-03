@@ -3,6 +3,7 @@ Query building helpers shared by log and export endpoints.
 """
 
 import logging
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -441,18 +442,47 @@ def validate_view_filters(filters: dict) -> str | None:
 # ── CSV export sanitization ─────────────────────────────────────────────────
 
 _CSV_FORMULA_PREFIXES = ('=', '+', '@', ';', '\t', '\r', '\n', '\0')
+_CSV_NEGATIVE_NUMBER = re.compile(r'-(?:[0-9]+(?:\.[0-9]+)?|\.[0-9]+)\Z')
+_CSV_NEGATIVE_FIELD = re.compile(r'-(?:[0-9]+(?:\.[0-9]+)?|\.[0-9]+)(?=$|[;\x00-\x1f\x7f])')
+_CSV_ALT_SEPARATORS = ';\t\r\n'
+# Fast path: no formula/whitespace/dash lead, no separator or control character.
+_CSV_PLAIN = re.compile(r'[^=+@\-\s\x00-\x1f\x7f;][^;\x00-\x1f\x7f]*')
+
+
+def _csv_formula_at(value: str, index: int) -> bool:
+    """Check a field start without copying the rest of a potentially long cell."""
+    if index == len(value):
+        return False
+    if value[index] == '-':
+        return not _CSV_NEGATIVE_FIELD.match(value, index)
+    return value[index] in _CSV_FORMULA_PREFIXES
+
+
+def _starts_csv_formula(value: str) -> bool:
+    """Detect a formula after optional whitespace, except plain negative fields."""
+    first = value.lstrip()
+    return _csv_formula_at(first, 0)
 
 
 def sanitize_csv_cell(value: str) -> str:
-    """Neutralize spreadsheet formula injection by prepending a single quote."""
-    if not value:
+    """Quote formulas, including cells re-split by a different CSV delimiter."""
+    if not value or _CSV_PLAIN.fullmatch(value):
         return value
-    ch = value[0]
-    if ch in _CSV_FORMULA_PREFIXES:
-        return "'" + value
-    # '-' is only dangerous when NOT followed by a digit or decimal point
-    if ch == '-':
-        rest = value[1:]
-        if not rest or not (rest[0].isdigit() or (rest[0] == '.' and len(rest) > 1 and rest[1].isdigit())):
-            return "'" + value
-    return value
+    # An importer using ';' or tabs can split a comma-CSV cell into new cells.
+    # Quote the new cell's formula marker after each possible separator too.
+    length = len(value)
+    next_content = [length] * (length + 1)
+    for index in range(length - 1, -1, -1):
+        next_content[index] = (next_content[index + 1] if value[index].isspace()
+                               else index)
+    escaped = ''.join(
+        ch + ("'" if ch in _CSV_ALT_SEPARATORS and
+              _csv_formula_at(value, next_content[index + 1]) else '')
+        for index, ch in enumerate(value)
+    )
+    if (_starts_csv_formula(value) or
+            (value.lstrip().startswith('-') and
+             not _CSV_NEGATIVE_NUMBER.fullmatch(value)) or
+            any(ord(ch) < 32 or ord(ch) == 127 for ch in value)):
+        return "'" + escaped
+    return escaped

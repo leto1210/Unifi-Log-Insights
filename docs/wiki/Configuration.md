@@ -23,9 +23,9 @@ With `AUTH_ENABLED=true`, an installation with no administrator exposes only
 administrator before using setup/configuration routes. Set a strong `SETUP_TOKEN`
 in the container environment. The enrollment request must use HTTPS and send
 the token in `X-Setup-Token`; a proxy's `X-Forwarded-Proto` is accepted only
-when it also sends the application's `X-ULI-Proxy-Auth` secret. The current UI
-does not guide this first enrollment; use a local administrative client. For
-an embedded database, an operator on the Docker host can retrieve the proxy
+when it also sends the application's `X-ULI-Proxy-Auth` secret. The login page
+shows a first-administrator form until enrollment is complete. For an embedded
+database, an operator on the Docker host can retrieve the proxy
 secret without placing it in a public endpoint:
 
 ```sh
@@ -33,9 +33,10 @@ docker exec -u postgres unifi-log-insight psql -d unifi_logs -Atc "SELECT value 
 ```
 
 Keep the returned secret private. Configure the reverse proxy to set
-`X-ULI-Proxy-Auth` to that value and `X-Forwarded-Proto` to `https`, then POST
-`/api/auth/setup` through the HTTPS URL with `X-Setup-Token` and JSON fields
-`username` and `password`:
+`X-ULI-Proxy-Auth` to that value and `X-Forwarded-Proto` to `https`, then use
+the first-administrator form over HTTPS. A local administrative client can
+also POST `/api/auth/setup` with `X-Setup-Token` and JSON fields `username`
+and `password`:
 
 ```http
 POST https://your-internal-host/api/auth/setup
@@ -52,6 +53,16 @@ database, retrieve the same
 `system_config` key through a local administrator connection. With
 `AUTH_ENABLED=false`, the internal single-user mode remains available without
 this enrollment.
+
+If users already exist but no active administrator remains, first enrollment
+is unavailable. Restore an administrator through a local database backup or
+controlled maintenance before returning to the login page; the public setup
+route must not be used to take over an existing installation.
+
+`/api/setup/status` returns only `setup_complete`. Its former exact
+`logs_count` field was removed because it counted the large logs table on a
+public setup request. Clients that relied on an exact count must obtain it
+separately; this status route no longer provides one.
 
 ## UniFi integration
 
@@ -74,6 +85,11 @@ A saved key or saved self-hosted credentials cannot be reused when the
 controller address changes; provide new credentials for the new controller.
 A connection test never sends saved credentials to an address other than the
 one associated with them.
+When importing a configuration backup, a new UniFi API key is associated with
+the effective host. Importing only a host does not move an existing key to it.
+An export that includes the saved API key records its bound host, even when
+`UNIFI_HOST` overrides the database host. If an older saved key has no valid
+host binding, the API refuses to include it until the association is repaired.
 
 ## GeoIP / Threat intelligence
 
