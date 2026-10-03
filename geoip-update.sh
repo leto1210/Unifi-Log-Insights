@@ -67,4 +67,5 @@ if geoipupdate -d "$DB_DIR" -f /etc/GeoIP.conf -v 2>&1; then
     fi
 else
     echo "$LOG_PREFIX ERROR: geoipupdate failed"
+    exit 1
 fi
