@@ -38,7 +38,7 @@ beforeEach(() => {
 
 describe('authentication UI gates', () => {
   it('creates the first administrator before loading the setup wizard', async () => {
-    fetchAuthStatus.mockResolvedValue({ auth_enabled_effective: true, has_admin: false, setup_complete: false, is_https: true, proxy_trusted: true })
+    fetchAuthStatus.mockResolvedValue({ auth_enabled_effective: true, has_users: false, has_admin: false, setup_complete: false, is_https: true, proxy_trusted: true })
     render(<App />)
 
     await screen.findByText('Create the first administrator')
@@ -54,7 +54,7 @@ describe('authentication UI gates', () => {
   })
 
   it('keeps enrollment open when the setup token is rejected', async () => {
-    fetchAuthStatus.mockResolvedValue({ auth_enabled_effective: true, has_admin: false, setup_complete: false, is_https: true, proxy_trusted: true })
+    fetchAuthStatus.mockResolvedValue({ auth_enabled_effective: true, has_users: false, has_admin: false, setup_complete: false, is_https: true, proxy_trusted: true })
     authSetup.mockRejectedValueOnce(new Error('Invalid setup token'))
     render(<App />)
 
@@ -77,17 +77,18 @@ describe('authentication UI gates', () => {
     expect(authSetup).not.toHaveBeenCalled()
   })
 
-  it('shows local recovery guidance when users exist without an active administrator', async () => {
-    fetchAuthStatus.mockResolvedValue({ auth_enabled_effective: true, has_users: true, has_admin: false, setup_complete: true })
+  it('shows the regular login when users exist without an active administrator', async () => {
+    fetchAuthStatus.mockResolvedValue({ auth_enabled_effective: true, has_users: true, has_admin: false, setup_complete: true, is_https: true, proxy_trusted: true })
+    fetchAuthMe.mockRejectedValue(new Error('No session'))
     render(<App />)
-    await screen.findByText('Administrator recovery required')
-    expect(screen.getByText(/Restore an administrator through a local database backup/)).toBeInTheDocument()
+    await screen.findByText('Login to your account')
     expect(screen.queryByText('Create the first administrator')).not.toBeInTheDocument()
+    expect(screen.queryByText('Administrator recovery required')).not.toBeInTheDocument()
     expect(fetchConfig).not.toHaveBeenCalled()
   })
 
   it('shows a retry after failed logout and clears session data only after success', async () => {
-    fetchAuthStatus.mockResolvedValue({ auth_enabled_effective: true, has_admin: true, setup_complete: true, is_https: true, proxy_trusted: true })
+    fetchAuthStatus.mockResolvedValue({ auth_enabled_effective: true, has_users: true, has_admin: true, setup_complete: true, is_https: true, proxy_trusted: true })
     fetchConfig.mockResolvedValue({ setup_complete: true, wan_interfaces: [], interface_labels: {}, vpn_networks: {} })
     authLogout.mockRejectedValueOnce(new Error('Server unavailable')).mockResolvedValueOnce({})
     render(<App />)
@@ -105,7 +106,7 @@ describe('authentication UI gates', () => {
   })
 
   it('drops cached data before showing a different signed-in user', async () => {
-    fetchAuthStatus.mockResolvedValue({ auth_enabled_effective: true, has_admin: true, setup_complete: true, is_https: true, proxy_trusted: true })
+    fetchAuthStatus.mockResolvedValue({ auth_enabled_effective: true, has_users: true, has_admin: true, setup_complete: true, is_https: true, proxy_trusted: true })
     fetchAuthMe.mockRejectedValueOnce(new Error('No session')).mockResolvedValueOnce({ authenticated: true, user_id: 2, username: 'new-admin' })
     fetchConfig.mockResolvedValue({ setup_complete: true, wan_interfaces: [], interface_labels: {}, vpn_networks: {} })
     sessionStorage.setItem('uli_identity', '1')

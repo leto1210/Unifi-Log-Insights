@@ -92,6 +92,30 @@ def test_after_admin_requires_authentication(protected_app):
     assert client.get('/api/health').status_code == 200
 
 
+def test_users_without_admin_can_still_authenticate(protected_app, monkeypatch):
+    """Active users but no admin: regular auth applies, nothing opens to anonymous.
+
+    Enrollment mode must only cover an installation with NO active user, or
+    existing viewer/operator accounts would be locked out of /api/auth/login.
+    """
+    client, auth, _tokens, state = protected_app
+    state.update(admin=False, users=True, auth_enabled=False)
+    # anonymous callers stay out of application routes
+    assert client.get('/api/logs').status_code == 401
+    assert client.get('/api/config').status_code == 401
+    # the login/logout endpoints are reachable (not the enrollment 401)
+    assert 'enrollment' not in client.post(
+        '/api/auth/login', json={'username': 'v', 'password': 'wrong-password'}
+    ).text.lower()
+    # an established viewer session works, read-only
+    monkeypatch.setattr(auth, '_validate_session', lambda _token: {
+        'user_id': 9, 'role_name': 'viewer', 'username': 'viewer',
+    })
+    client.cookies.set('uli_session', 'synthetic-session')
+    assert client.get('/api/logs').status_code == 200
+    assert client.post('/api/tokens', json={'name': 'x', 'scopes': ['logs.read']}).status_code == 403
+
+
 def test_steady_state_skips_admin_existence_query(protected_app, monkeypatch):
     """Once the DB flag confirms bootstrap is done, require_auth() must not
     re-run _has_admin()'s JOIN query on every request — only the cold

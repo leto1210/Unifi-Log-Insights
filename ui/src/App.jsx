@@ -154,7 +154,7 @@ export default function App() {
   const [logsPaused, setLogsPaused] = useState(false)
   const onLogsPauseChange = useCallback((paused) => setLogsPaused(paused), [])
   const [uiSettings, setUiSettings] = useState(null)
-  const [authState, setAuthState] = useState('loading') // 'loading', 'setup', 'admin-missing', 'login', 'authenticated', 'none'
+  const [authState, setAuthState] = useState('loading') // 'loading', 'setup', 'login', 'authenticated', 'none'
   const [authStatus, setAuthStatus] = useState(null) // response from /api/auth/status
   const [logoutError, setLogoutError] = useState('')
   const [loggingOut, setLoggingOut] = useState(false)
@@ -217,7 +217,7 @@ export default function App() {
 
   // Fetch UI settings after auth resolves (avoids 401 when auth is enabled)
   useEffect(() => {
-    if (authState === 'loading' || authState === 'login' || authState === 'setup' || authState === 'admin-missing') return
+    if (authState === 'loading' || authState === 'login' || authState === 'setup') return
     fetchUiSettings().then(data => {
       setUiSettings(data)
       if (!localStorage.getItem('ui_theme') && data.ui_theme && data.ui_theme !== initialThemeRef.current) {
@@ -315,9 +315,10 @@ export default function App() {
         setAuthStatus(status)
 
         // With authentication enabled, the first administrator must be
-        // enrolled before the setup wizard can call protected APIs.
-        if (status.auth_enabled_effective && !status.has_admin) {
-          setAuthState(status.has_users ? 'admin-missing' : 'setup')
+        // enrolled before the setup wizard can call protected APIs. Existing
+        // users without an admin still go through the regular login screen.
+        if (status.auth_enabled_effective && !status.has_users) {
+          setAuthState('setup')
           return
         }
 
@@ -359,7 +360,7 @@ export default function App() {
 
   // Load config + interface labels after auth resolves
   useEffect(() => {
-    if (authState === 'loading' || authState === 'login' || authState === 'setup' || authState === 'admin-missing') return
+    if (authState === 'loading' || authState === 'login' || authState === 'setup') return
     let mounted = true
     fetchConfig()
       .then(cfg => {
@@ -427,7 +428,7 @@ export default function App() {
 
   // Detect unlabeled VPN interfaces and show toast (polls every 5 min)
   useEffect(() => {
-    if (authState === 'loading' || authState === 'login' || authState === 'setup' || authState === 'admin-missing') return
+    if (authState === 'loading' || authState === 'login' || authState === 'setup') return
     if (!config || !configLoaded) return
 
     const checkVpn = () => {
@@ -459,7 +460,7 @@ export default function App() {
 
   // Check UniFi controller connection status and show toast if disconnected
   useEffect(() => {
-    if (authState === 'loading' || authState === 'login' || authState === 'setup' || authState === 'admin-missing') return
+    if (authState === 'loading' || authState === 'login' || authState === 'setup') return
     if (!config || !configLoaded) return
     if (!config.unifi_enabled) return
     const dismissed = sessionStorage.getItem('unifi_toast_dismissed')
@@ -565,18 +566,6 @@ export default function App() {
   // Auth gates
   if (authState === 'loading') {
     return <LoadingSplash />
-  }
-
-  if (authState === 'admin-missing') {
-    return (
-      <div className="flex min-h-dvh items-center justify-center bg-gray-950 px-4 text-gray-200">
-        <div className="max-w-lg rounded-xl border border-amber-500/30 bg-gray-900 p-6">
-          <h1 className="text-xl font-semibold">Administrator recovery required</h1>
-          <p className="mt-3 text-sm text-gray-300">Users already exist, but no active administrator remains. Restore an administrator through a local database backup or controlled maintenance before signing in.</p>
-          <a className="mt-3 inline-block text-sm text-teal-400 underline" href="https://github.com/leto1210/Unifi-Log-Insights/wiki/Configuration">See the Configuration documentation</a>
-        </div>
-      </div>
-    )
   }
 
   if (authState === 'login' || authState === 'setup') {

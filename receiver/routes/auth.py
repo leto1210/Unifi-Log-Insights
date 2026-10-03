@@ -499,15 +499,21 @@ def require_auth(request: Request) -> dict | None:
     # request. The admin-existence check only runs on the rare cold path
     # below (first boot, or a DB flag that hasn't caught up yet).
     if not bool(get_config(enricher_db, 'auth_enabled', False)):
-        if not _has_admin():
+        if _has_admin():
+            # Admin exists but the DB flag is stale (e.g. toggled off then on,
+            # or this is the first request after enrollment) — sync it so this
+            # cold path isn't repeated on every subsequent request.
+            set_config(enricher_db, 'auth_enabled', True)
+            logger.info("Auto-enabled auth: AUTH_ENABLED=true and admin user exists in DB")
+        elif not _has_users():
+            # Enrollment mode: nobody can authenticate yet, so only the
+            # endpoints needed to create the first admin are reachable.
             if path in BOOTSTRAP_PATHS:
                 return None
             raise HTTPException(401, "Administrator enrollment required")
-        # Admin exists but the DB flag is stale (e.g. toggled off then on,
-        # or this is the first request after enrollment) — sync it so this
-        # cold path isn't repeated on every subsequent request.
-        set_config(enricher_db, 'auth_enabled', True)
-        logger.info("Auto-enabled auth: AUTH_ENABLED=true and admin user exists in DB")
+        # else: active users but no admin. Regular authentication below still
+        # applies (sessions/tokens required, viewer stays read-only), so
+        # existing users can sign in; nothing is opened to anonymous callers.
 
     if path in PUBLIC_PATHS or any(path.startswith(p) for p in PUBLIC_PREFIXES):
         return None
