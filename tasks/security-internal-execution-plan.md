@@ -1,6 +1,6 @@
 # Plan d'exécution différée — sécurité de l'auto-hébergement interne
 
-Date : 2026-09-29. Mise à jour : 2026-10-03. État : lots 0 à 2 exécutés ; PR #71 des lots 1 et 2 ouverte en brouillon ; lot 3 non lancé.
+Date : 2026-09-29. Mise à jour : 2026-10-03. État : lots 0 à 3 exécutés ; PR #71 des lots 1 à 3 ouverte en brouillon ; aucun déploiement.
 Référence de l'audit : commit `306918c`, branche `codex/fix-maplibre-worker-bundle`.
 
 Référence préparée pour les corrections : `677f14ecab5552c5171fe3d2877059d1e191bbff`, branche `codex/security-internal-hardening`. Le bilan local du lot 0 est conservé hors du dépôt.
@@ -9,13 +9,15 @@ Référence préparée pour les corrections : `677f14ecab5552c5171fe3d2877059d1e
 
 État Git du lot 2 au 2026-10-03 : commit `d152655` créé dans le checkout isolé, puis intégré dans la branche de la PR #71 sous `66101fb`, à partir de `e370aaf`. A4-A6 et la documentation sont implémentés, sans déploiement. Vérifications : 791 tests backend, 141 tests UI, build UI et syntaxe des neuf Python touchés réussis. Le smoke test conteneur reste au lot 3.
 
+État Git du lot 3 au 2026-10-03 : branche `codex/security-internal-lot-3` fondée sur la tête `5a0ad61` de la PR #71. Les commits `c31450c` (import UniFi), `7bf841f` (volume vierge), `553bd10` (verrou npm) et `99ae033` (tests A7) sont intégrés à la branche de la PR #71 avec ce bilan. Aucun déploiement. Vérifications : 795 tests backend, 141 tests UI, build UI, syntaxe Python et shell, puis santé, enrôlement, connexion, refus anonyme et redémarrage sur volume Docker vierge jetable.
+
 ## 1. Objectif et périmètre
 
 Améliorer la sécurité et la disponibilité d'une application auto-hébergée sur un réseau interne. Ne pas concevoir ce chantier comme une préparation à une exposition Internet. Les clients possibles sont l'administrateur, des utilisateurs internes, des intégrations et des agents munis de jetons API. Une machine interne compromise reste un scénario pertinent.
 
 Conserver le mode mono-utilisateur explicitement choisi avec `AUTH_ENABLED=false`, les contrôleurs locaux et les installations avec certificats auto-signés. Distinguer ce mode volontaire de l'installation incomplète avec `AUTH_ENABLED=true`.
 
-Les lots 0, 1 et 2 ont été lancés par demandes distinctes ; le lot 1 a aussi été commité, poussé et proposé en PR à la demande. Le présent document prépare la suite sans lancer le lot 3. Une future demande de lancement autorisera les modifications locales et vérifications du périmètre demandé ; elle n'autorise pas automatiquement fusion, publication, déploiement, rotation de secrets, modification des équipements ou migration de la base de production.
+Les lots 0 à 3 ont été lancés par demandes distinctes, puis commités et poussés dans la PR #71 à la demande. Cette publication n'autorise pas automatiquement fusion, déploiement, rotation de secrets, modification des équipements ou migration de la base de production.
 
 ## 2. Consignes communes à tous les agents
 
@@ -150,6 +152,8 @@ Tests : `-5`, `-123.45`, `-.5` préservés ; `-1+1` et une formule utilisant une
 
 ### Lot 3 — Validation transverse, documentation et dépendances
 
+État : A7 et A8 terminés localement. La revue indépendante a reproduit un transfert des anciens identifiants UniFi self-hosted lors d'un import d'hôte seul ; l'import lie désormais ces identifiants à leur ancien hôte ou refuse le changement si celui-ci est inconnu. Le premier smoke test de l'image a révélé que quatre tables créées par `init.sql` n'appartenaient pas à l'utilisateur exécutant leurs migrations ; la propriété est corrigée seulement pour ces tables lors de l'initialisation d'un volume vierge. Un second smoke test complet passe, y compris après redémarrage. `undici` est mis à jour uniquement dans le verrou npm.
+
 #### A7 — Spécialiste QA sécurité, indépendant des correctifs
 
 Lecture seule des changements A1-A6 ; nouveaux tests de régression possibles dans des fichiers réservés.
@@ -187,23 +191,23 @@ Ces tâches ne bloquent pas les lots 1 à 3 pour l'usage interne.
 
 ## 5. Critères de fin et vérifications
 
-- [ ] Toutes les tâches du périmètre lancé ont une reproduction, une correction et une revue indépendante.
-- [ ] Chaque test de sécurité ajouté traverse le code de production concerné.
-- [ ] Syntaxe de chaque Python modifié vérifiée, par exemple `rtk proxy python3 -c "import ast; ast.parse(open('receiver/routes/auth.py').read())"`.
-- [ ] Suite backend complète : depuis `receiver/`, `rtk proxy python -m pytest tests/ -v --tb=short` avec l'interpréteur de l'environnement préparé.
-- [ ] Frontend : depuis `ui/`, `rtk npm test` et `rtk npm run build` ; contrôler aussi les assets émis si leur chargement change.
-- [ ] `rtk git diff --check`, revue du diff, absence de secrets ou fichiers temporaires ajoutés.
-- [ ] Construire l'image et faire un smoke test local isolé sur volume vierge : santé, enrôlement, connexion, refus anonyme et redémarrage. Aucun volume de production monté.
+- [x] Toutes les tâches du périmètre lancé ont une reproduction, une correction et une revue indépendante.
+- [x] Chaque test de sécurité ajouté traverse le code de production concerné.
+- [x] Syntaxe de chaque Python modifié et de `entrypoint.sh` vérifiée.
+- [x] Suite backend complète : 795 tests réussis avec l'interpréteur de l'environnement préparé.
+- [x] Frontend : 141 tests réussis et build Vite de production réussi.
+- [x] `git diff --check`, revue du diff et absence de secrets ou fichiers temporaires ajoutés.
+- [x] Image construite et smoke test local isolé sur volume vierge : santé, enrôlement, connexion, refus anonyme et redémarrage. Conteneur et volume supprimés.
 - [ ] Si A9 est lancé : tests supplémentaires sur volume ancien synthétique et DB externe, sauvegarde/restauration validée.
-- [ ] Rapport final : périmètre exact, résultats de tests, risques restants, changements de comportement et procédure de retour arrière.
+- [x] Rapport final : voir le bilan du lot 3 ci-dessous.
 
 Pour la suite, suivre les règles du dépôt pour revue externe, limitation des déclenchements et suivi. La PR #71 est déjà ouverte ; vérifier sa CI et ses commentaires avant d'y ajouter un correctif, et regrouper les corrections retenues. Ne pas déclencher de nouvelle revue ou automatisation au seul titre de la mise à jour du plan. Utiliser les outils d'automatisation réellement disponibles au moment du lancement plutôt qu'une commande historique inexistante.
 
-## 6. Prompt de lancement prêt à copier
+## 6. Prompt pour la suite à instruire
 
-> Lance uniquement le lot 3 de `tasks/security-internal-execution-plan.md` pour l'auto-hébergement interne. Revalide la tête, la CI et les commentaires de la PR #71 et l'état local du lot 2 avant toute opération Git. Charge A7 de la revue indépendante des changements A1-A6, A8 de l'audit et des mises à jour minimales des dépendances, puis effectue la validation transverse. Exécute les suites backend/frontend, le build UI, les analyses de syntaxe Python, la revue du diff et un smoke test de l'image sur un volume **vierge et jetable** : santé, enrôlement, connexion, refus anonyme et redémarrage. Mets à jour la documentation et livre un bilan avec risques résiduels et retour arrière. Ne lance pas le lot 4, ne fusionne pas, ne pousse pas, ne crée pas de PR et ne déploie pas sans demande distincte. Ne contacte pas les équipements de production.
+> Revalide la tête, la CI et les commentaires de la PR #71 après l'intégration du lot 3. Examine les quatre commits et le bilan, puis traite les seuls retours confirmés. Ne fusionne pas, ne lance pas le lot 4 et ne déploie pas sans demande distincte. Ne contacte pas les équipements de production.
 
-Pour lancer le lot 4 plus tard, adapter le périmètre explicitement ; toujours revalider la base Git, respecter les dépendances et isoler les changements. A7 peut maintenant examiner A1-A6.
+Le lot 4 reste optionnel et doit être demandé explicitement ; toujours revalider la base Git, respecter les dépendances et isoler les changements.
 
 ## 7. Revue de préparation
 
@@ -214,4 +218,13 @@ Pour lancer le lot 4 plus tard, adapter le périmètre explicitement ; toujours 
 - [x] Lot 0 exécuté et documenté le 2026-09-30.
 - [x] Lot 1 exécuté et proposé dans la PR #71, tête synchronisée à `e370aaf` le 2026-09-30.
 - [x] Lot 2 implémenté, vérifié et intégré à la branche de la PR #71 le 2026-10-03 ; aucune validation conteneur ni déploiement.
-- [ ] Lots 3 et 4 non commencés.
+- [x] Lot 3 exécuté, vérifié et intégré à la branche de la PR #71 le 2026-10-03, sans déploiement.
+- [ ] Lot 4 non commencé.
+
+## 8. Bilan du lot 3
+
+La revue A7 a ajouté des tests traversant les vraies routes d'import et le résolveur UniFi, le contrôle des droits MCP effectifs vides et une matrice de courtes cellules CSV réinterprétées avec des séparateurs alternatifs. Le correctif de l'import empêche une clé ou un login historique de suivre silencieusement un nouvel hôte. Sur volume vierge, l'image ne démarrait pas car `sessions` appartenait à `postgres` alors que les migrations s'exécutent comme `unifi` ; les quatre tables de `init.sql` sur lesquelles ces migrations effectuent un DDL reçoivent désormais le bon propriétaire dans la seule branche d'initialisation. Aucun volume préexistant n'a été modifié.
+
+L'audit npm production signale 0 avis. L'audit complet est passé de 8 à 5 avis `high`, tous rattachés à `braces` dans des outils de développement ; npm ne propose pas de correctif compatible au niveau racine. Les scanners Python et image (`pip-audit`, Trivy, Grype, Syft) ne sont pas installés : leur absence n'est pas une preuve d'absence de vulnérabilités. Les avertissements Vite sur la taille du bundle et les imports dynamiques restent présents.
+
+Avant fusion ou déploiement, le retour arrière du lot 3 consiste à retirer ses commits de la PR par des commits de réversion ciblés. L'image et les données du test étaient jetables et ont été nettoyées. Une migration de base préexistante et le durcissement PostgreSQL restent dans le lot 4 optionnel.
