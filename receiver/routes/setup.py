@@ -541,26 +541,35 @@ def import_config(body: dict):
 
     imported_keys = []
     failed_keys = []
-    # Legacy saved keys may have no destination binding yet. Preserve their
-    # original host before importing a different one; otherwise reload_config()
-    # could bind the old key to the newly imported host.
-    host_change_blocked = False
-    if ('unifi_host' in config and
-            get_config(enricher_db, _API_KEY_CONFIG_KEY, '')):
+    # Bind legacy secrets to their original host before importing a different
+    # one; otherwise reload_config() could bind them to the imported host.
+    key_host_change_blocked = False
+    credentials_host_change_blocked = False
+    if 'unifi_host' in config:
         old_host = get_config(enricher_db, 'unifi_host', '')
-        if not get_config(enricher_db, 'unifi_api_key_host', ''):
+        if (get_config(enricher_db, _API_KEY_CONFIG_KEY, '') and
+                not get_config(enricher_db, 'unifi_api_key_host', '')):
             if old_host:
                 set_config(enricher_db, 'unifi_api_key_host', old_host)
             else:
-                host_change_blocked = True
+                key_host_change_blocked = True
+        if ((get_config(enricher_db, 'unifi_username', '') or
+             get_config(enricher_db, 'unifi_password', '')) and
+                not get_config(enricher_db, 'unifi_credentials_host', '')):
+            if old_host:
+                set_config(enricher_db, 'unifi_credentials_host', old_host)
+            else:
+                credentials_host_change_blocked = True
     # A legacy key with no known old host can only be replaced as a complete
-    # key+host pair. Defer the host write until the new key is stored.
-    deferred_host = (config['unifi_host'] if host_change_blocked and
+    # key+host pair. Credentials with no known old host cannot follow either.
+    deferred_host = (config['unifi_host'] if key_host_change_blocked and
+                     not credentials_host_change_blocked and
                      config.get(_API_KEY_CONFIG_KEY) else None)
     for key in _EXPORTABLE_KEYS:
         if key not in config:
             continue
-        if key == 'unifi_host' and host_change_blocked:
+        if key == 'unifi_host' and (key_host_change_blocked or
+                                    credentials_host_change_blocked):
             if deferred_host is None:
                 failed_keys.append(key)
             continue

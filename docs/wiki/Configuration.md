@@ -87,6 +87,10 @@ A connection test never sends saved credentials to an address other than the
 one associated with them.
 When importing a configuration backup, a new UniFi API key is associated with
 the effective host. Importing only a host does not move an existing key to it.
+The same rule applies to saved self-hosted username/password credentials from
+older installations: a host-only import keeps them bound to the previous host.
+If that previous host is unknown, the import refuses the host change; configure
+the new host with fresh credentials through Settings instead.
 An export that includes the saved API key records its bound host, even when
 `UNIFI_HOST` overrides the database host. If an older saved key has no valid
 host binding, the API refuses to include it until the association is repaired.
