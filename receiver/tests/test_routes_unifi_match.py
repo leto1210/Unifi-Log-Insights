@@ -248,8 +248,9 @@ class TestImportCacheInvalidation:
             assert resp.status_code == 200
             mock_inv.assert_called_once()
 
-    def test_import_unifi_api_key_invalidates_cache(self, setup_client):
+    def test_import_unifi_api_key_invalidates_cache(self, setup_client, monkeypatch):
         client, mock_deps, mock_db = setup_client
+        monkeypatch.setenv('UNIFI_HOST', 'https://controller.lan')
         mock_db.encrypt_api_key.return_value = 'encrypted_value'
         with patch('routes.setup.invalidate_fw_cache') as mock_inv:
             resp = client.post('/api/config/import', json={

@@ -14,7 +14,7 @@ from fastapi import APIRouter, HTTPException, Request
 from psycopg2.extras import RealDictCursor
 
 from deps import get_conn, put_conn
-from routes.auth import _require_https, get_real_client_ip, _write_audit
+from routes.auth import _require_https, _auth_enabled, get_real_client_ip, _write_audit
 
 logger = logging.getLogger('api.tokens')
 router = APIRouter()
@@ -141,8 +141,10 @@ def _require_session_admin(request: Request) -> dict:
     """
     auth_info = getattr(request.state, 'auth_info', None)
     if auth_info is None:
-        # Auth disabled — allow (single-user mode, no identity to attribute)
-        return {}
+        if not _auth_enabled():
+            # Explicit no-auth single-user mode has no identity to attribute.
+            return {}
+        raise HTTPException(401, "Session authentication required")
 
     if not auth_info.get('user_id'):
         raise HTTPException(401, "Session authentication required")

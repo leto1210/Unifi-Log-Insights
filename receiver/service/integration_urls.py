@@ -23,7 +23,9 @@ def normalize_integration_base_url(raw_url: str, *, strip_admin_path: bool = Fal
             raise ValueError('Invalid URL')
         if not parsed.hostname:
             raise ValueError('Invalid URL')
-        if parsed.username or parsed.password or parsed.params or parsed.query or parsed.fragment:
+        if (parsed.username is not None or parsed.password is not None
+                or parsed.params or parsed.query or parsed.fragment
+                or '\\' in value or any(c.isspace() for c in value)):
             raise ValueError('Invalid URL')
         # Accessing .port validates malformed port strings.
         port = parsed.port
@@ -40,6 +42,21 @@ def normalize_integration_base_url(raw_url: str, *, strip_admin_path: bool = Fal
         path = ''
 
     return urlunparse((parsed.scheme, netloc, path, '', '', ''))
+
+
+def same_integration_destination(first: str, second: str,
+                                 *, strip_admin_path: bool = False) -> bool:
+    """Compare scheme, host, effective port and base path of two safe URLs."""
+    def identity(value):
+        normalized = normalize_integration_base_url(
+            value, strip_admin_path=strip_admin_path)
+        parsed = urlparse(normalized)
+        if '%' in parsed.path or any(part in ('.', '..') for part in parsed.path.split('/')):
+            raise ValueError('Invalid URL')
+        port = parsed.port or (443 if parsed.scheme == 'https' else 80)
+        return parsed.scheme, parsed.hostname, port, parsed.path
+
+    return identity(first) == identity(second)
 
 
 def build_integration_url(base_url: str, api_path: str) -> str:

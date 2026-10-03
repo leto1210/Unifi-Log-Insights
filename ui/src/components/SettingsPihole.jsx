@@ -77,9 +77,14 @@ export default function SettingsPihole() {
       || (!!draft.password)
   }, [settings, draft])
 
+  const hostChanged = !!settings && !!draft &&
+    (draft.host || '').trim().replace(/\/+$/, '').toLowerCase() !==
+    (settings.host || '').trim().replace(/\/+$/, '').toLowerCase()
+
   // Block save if enabling without a host configured
   const canSave = hasChanges && (!needsTest || testPassed)
     && !(draft?.enabled && !draft?.host)
+    && (!hostChanged || !!draft.password)
 
   async function handleSave() {
     setSaving(true)
@@ -255,9 +260,12 @@ export default function SettingsPihole() {
                 type="password"
                 value={draft.password || ''}
                 onChange={e => { setDraft(prev => ({ ...prev, password: e.target.value })); setTestPassed(false); setTestResult(null) }}
-                placeholder={settings?.password_set ? '(saved, leave blank to keep)' : 'Pi-hole admin password'}
+                placeholder={hostChanged ? 'Password for the new Pi-hole host' : settings?.password_set ? '(saved, leave blank to keep)' : 'Pi-hole admin password'}
                 className={INPUT_CLS}
               />
+              {hostChanged && !draft.password && (
+                <p className="mt-1 text-sm text-amber-400" role="alert">Enter a new password for this Pi-hole host. The saved password is tied to the previous host.</p>
+              )}
             </div>
 
             {/* Poll interval */}
@@ -299,7 +307,7 @@ export default function SettingsPihole() {
             <div className="flex items-center gap-3">
               <button
                 onClick={handleTest}
-                disabled={testing || !draft.host}
+                disabled={testing || !draft.host || (hostChanged && !draft.password)}
                 className="px-3 py-1.5 rounded text-sm font-medium border border-gray-600 text-gray-300 hover:bg-gray-700 hover:text-white transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
               >
                 {testing ? 'Testing...' : 'Test Connection'}

@@ -1,12 +1,14 @@
 """Pi-hole v6 settings, connection test endpoints."""
 
 import logging
+import os
 
 from fastapi import APIRouter, HTTPException
 
-from db import get_config, set_config, encrypt_api_key
+from db import get_config, encrypt_api_key
 from deps import enricher_db, signal_receiver, pihole_poller
 from pihole_api import _validate_pihole_url
+from service.integration_urls import same_integration_destination
 
 logger = logging.getLogger('api.pihole')
 
@@ -22,6 +24,15 @@ def get_pihole_settings():
 @router.put("/api/settings/pihole")
 def update_pihole_settings(body: dict):
     """Save Pi-hole settings to system_config."""
+    with pihole_poller._config_lock:
+        result = _update_pihole_settings_locked(body)
+    pihole_poller.reload_config()
+    signal_receiver()
+    return result
+
+
+def _update_pihole_settings_locked(body: dict):
+    """Persist host and password under the shared client lock."""
     # Validate all fields before persisting anything
     interval = None
     if 'poll_interval' in body:
@@ -47,31 +58,49 @@ def update_pihole_settings(body: dict):
         else:
             normalized_host = ''
 
-    # All valid — persist
+    changed = False
+    if normalized_host and os.environ.get('PIHOLE_PASSWORD') and not os.environ.get('PIHOLE_HOST'):
+        raise HTTPException(400, 'PIHOLE_HOST is required with PIHOLE_PASSWORD')
+    if normalized_host:
+        bound_host = get_config(enricher_db, 'pihole_host', '')
+        saved_password = get_config(enricher_db, 'pihole_password', '')
+        try:
+            changed = (not bound_host and bool(saved_password)) or (
+                bool(bound_host) and not same_integration_destination(
+                    normalized_host, bound_host, strip_admin_path=True))
+        except ValueError:
+            changed = True
+        if changed and (not body.get('password') or os.environ.get('PIHOLE_PASSWORD')):
+            raise HTTPException(400, 'New password is required when changing the Pi-hole host')
+
+    # All valid — persist in one transaction, so a failure (e.g. encryption)
+    # cannot leave the old password wiped while the new host is stored.
     current_host = get_config(enricher_db, 'pihole_host', '')
+    updates = {}
 
     if 'enabled' in body:
-        set_config(enricher_db, 'pihole_enabled', body['enabled'])
+        updates['pihole_enabled'] = body['enabled']
         if not body['enabled']:
-            set_config(enricher_db, 'pihole_poll_status', None)
+            updates['pihole_poll_status'] = None
     if 'host' in body:
-        set_config(enricher_db, 'pihole_host', normalized_host)
-    if 'password' in body:
-        val = body['password']
-        if val:
-            set_config(enricher_db, 'pihole_password', encrypt_api_key(val))
+        if changed:
+            updates['pihole_password'] = ''
+        updates['pihole_host'] = normalized_host
+    if body.get('password'):
+        password_host = normalized_host or current_host
+        if not password_host:
+            raise HTTPException(400, 'A Pi-hole host is required to save a password')
+        updates['pihole_password_host'] = password_host
+        updates['pihole_password'] = encrypt_api_key(body['password'])
     if interval is not None:
-        set_config(enricher_db, 'pihole_poll_interval', interval)
+        updates['pihole_poll_interval'] = interval
     if 'enrichment' in body:
-        set_config(enricher_db, 'pihole_enrichment', body['enrichment'])
+        updates['pihole_enrichment'] = body['enrichment']
 
     # Reset cursor when host changes so we re-fetch from the new instance
-    new_host = normalized_host
-    if new_host is not None and new_host != current_host:
-        set_config(enricher_db, 'pihole_last_cursor', 0)
-
-    pihole_poller.reload_config()
-    signal_receiver()
+    if normalized_host is not None and normalized_host != current_host:
+        updates['pihole_last_cursor'] = 0
+    enricher_db.set_config_many(updates)
 
     return {"success": True}
 

@@ -1,9 +1,7 @@
 """Regression tests for GET /api/auth/status.
 
 The endpoint fires on every SPA page load. It must derive `setup_complete`
-straight from `system_config` and must NOT trigger the COUNT(*) over the
-42 M-row `logs` table that `routes.setup.setup_status()` runs for its
-(wizard-only) `logs_count` field.
+straight from `system_config` without counting the large `logs` table.
 """
 
 import sys

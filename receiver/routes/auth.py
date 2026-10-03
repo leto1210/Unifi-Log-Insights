@@ -221,6 +221,7 @@ def _require_https(request: Request):
 
 
 def _auth_enabled() -> bool:
+    """Report whether authentication is required by this deployment."""
     if not AUTH_ENABLED:
         return False
     enabled = bool(get_config(enricher_db, 'auth_enabled', False))
@@ -231,7 +232,9 @@ def _auth_enabled() -> bool:
         set_config(enricher_db, 'auth_enabled', True)
         logger.info("Auto-enabled auth: AUTH_ENABLED=true and admin user exists in DB")
         return True
-    return enabled
+    # An incomplete installation is protected too. The DB flag is only set
+    # after the first admin is created; it must never open the API meanwhile.
+    return True
 
 
 def _has_users() -> bool:
@@ -439,7 +442,7 @@ def validate_token_with_effective_scopes(token: str) -> dict | None:
         return None
     token_scopes = set(info.get('scopes') or [])
     owner_perms = set(info.get('user_permissions') or [])
-    if info.get('owner_user_id') and owner_perms and '*' not in owner_perms:
+    if info.get('owner_user_id') is not None and '*' not in owner_perms:
         effective = token_scopes & owner_perms
     else:
         effective = token_scopes
@@ -457,6 +460,15 @@ PUBLIC_PATHS = {
     '/api/auth/logout',
     '/api/auth/setup',
     '/api/setup/status',
+}
+
+# During first-admin enrollment, expose only the endpoints required to check
+# health and complete enrollment. In particular, setup/config and token routes
+# cannot be used without an authenticated administrator.
+BOOTSTRAP_PATHS = {
+    '/api/health',
+    '/api/auth/status',
+    '/api/auth/setup',
 }
 
 PUBLIC_PREFIXES = (
@@ -477,10 +489,32 @@ AUTH_SESSION_PATHS = {
 def require_auth(request: Request) -> dict | None:
     """Auth dependency. Returns user/token info or None if auth disabled.
     Raises 401 if auth enabled and no valid credentials."""
-    if not _auth_enabled():
+    if not AUTH_ENABLED:
         return None
 
     path = request.url.path
+    # Fast path: once bootstrap has completed the DB flag is set, so steady
+    # -state requests pay for one config read here (same as pre-bootstrap
+    # code) instead of also running _has_admin()'s JOIN query on every
+    # request. The admin-existence check only runs on the rare cold path
+    # below (first boot, or a DB flag that hasn't caught up yet).
+    if not bool(get_config(enricher_db, 'auth_enabled', False)):
+        if _has_admin():
+            # Admin exists but the DB flag is stale (e.g. toggled off then on,
+            # or this is the first request after enrollment) — sync it so this
+            # cold path isn't repeated on every subsequent request.
+            set_config(enricher_db, 'auth_enabled', True)
+            logger.info("Auto-enabled auth: AUTH_ENABLED=true and admin user exists in DB")
+        elif not _has_users():
+            # Enrollment mode: nobody can authenticate yet, so only the
+            # endpoints needed to create the first admin are reachable.
+            if path in BOOTSTRAP_PATHS:
+                return None
+            raise HTTPException(401, "Administrator enrollment required")
+        # else: active users but no admin. Regular authentication below still
+        # applies (sessions/tokens required, viewer stays read-only), so
+        # existing users can sign in; nothing is opened to anonymous callers.
+
     if path in PUBLIC_PATHS or any(path.startswith(p) for p in PUBLIC_PREFIXES):
         return None
 
@@ -508,11 +542,8 @@ def require_auth(request: Request) -> dict | None:
 @router.get("/api/auth/status")
 def auth_status(request: Request):
     """Public bootstrap endpoint for SPA."""
-    # Read `setup_complete` straight from system_config instead of calling
-    # routes.setup.setup_status(), which also runs a COUNT(*) over the 42 M-row
-    # `logs` table for its `logs_count` field. This endpoint fires on every SPA
-    # page load and never uses logs_count, so that COUNT was ~1 s of wasted work
-    # on each call — see setup_status() for the full (wizard-only) payload.
+    # Read `setup_complete` straight from system_config. Both this endpoint
+    # and /api/setup/status avoid counting the large logs table on page load.
     auth_enabled = _auth_enabled()
     result = {
         "auth_enabled_effective": auth_enabled,

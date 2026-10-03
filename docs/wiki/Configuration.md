@@ -16,6 +16,53 @@ Every environment variable the container reads, what it controls, and safe defau
 | `TZ` | `UTC` | Container timezone. Affects retention cleanup window and log display. |
 | `LOG_LEVEL` | `INFO` | One of `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`. Applies to receiver + API. |
 | `AUTH_ENABLED` | `false` | Enable session-based auth. Enables the login screen and required for MCP tokens. |
+| `SETUP_TOKEN` | *(empty)* | Long random token required to enroll the first administrator when `AUTH_ENABLED=true`. |
+
+With `AUTH_ENABLED=true`, an installation with no administrator exposes only
+`/api/health`, `/api/auth/status`, and `/api/auth/setup`. Create the first
+administrator before using setup/configuration routes. Set a strong `SETUP_TOKEN`
+in the container environment. The enrollment request must use HTTPS and send
+the token in `X-Setup-Token`; a proxy's `X-Forwarded-Proto` is accepted only
+when it also sends the application's `X-ULI-Proxy-Auth` secret. The login page
+shows a first-administrator form until enrollment is complete. For an embedded
+database, an operator on the Docker host can retrieve the proxy
+secret without placing it in a public endpoint:
+
+```sh
+docker exec -u postgres unifi-log-insight psql -d unifi_logs -Atc "SELECT value #>> '{}' FROM system_config WHERE key = 'proxy_auth_token'"
+```
+
+Keep the returned secret private. Configure the reverse proxy to set
+`X-ULI-Proxy-Auth` to that value and `X-Forwarded-Proto` to `https`, then use
+the first-administrator form over HTTPS. A local administrative client can
+also POST `/api/auth/setup` with `X-Setup-Token` and JSON fields `username`
+and `password`:
+
+```http
+POST https://your-internal-host/api/auth/setup
+Content-Type: application/json
+X-Setup-Token: <your SETUP_TOKEN>
+
+{"username":"admin","password":"<new strong password>"}
+```
+
+The password must be at least 8 characters and no more than 72 UTF-8 bytes.
+The response sets a secure session cookie. Keep the setup token and proxy
+secret out of shell history, logs, and support tickets. For an external
+database, retrieve the same
+`system_config` key through a local administrator connection. With
+`AUTH_ENABLED=false`, the internal single-user mode remains available without
+this enrollment.
+
+If users already exist but no active administrator remains, first enrollment
+is unavailable. Restore an administrator through a local database backup or
+controlled maintenance before returning to the login page; the public setup
+route must not be used to take over an existing installation.
+
+`/api/setup/status` returns only `setup_complete`. Its former exact
+`logs_count` field was removed because it counted the large logs table on a
+public setup request. Clients that relied on an exact count must obtain it
+separately; this status route no longer provides one.
 
 ## UniFi integration
 
@@ -29,6 +76,24 @@ Every environment variable the container reads, what it controls, and safe defau
 | `UNIFI_ENABLED` | *(runtime)* | Runtime toggle in Settings; env var override rarely needed. |
 
 Self-hosted (UniFi Network Server) controllers use username/password instead of an API key — set them via the Settings UI, no env var equivalent.
+
+When `UNIFI_API_KEY` comes from the environment, set `UNIFI_HOST` there too.
+The key is used only for that configured destination. This pairing requirement
+applies only to the API-key (UniFi OS) flow — self-hosted username/password
+testing and host changes never read `UNIFI_API_KEY` and are unaffected by it.
+A saved key or saved self-hosted credentials cannot be reused when the
+controller address changes; provide new credentials for the new controller.
+A connection test never sends saved credentials to an address other than the
+one associated with them.
+When importing a configuration backup, a new UniFi API key is associated with
+the effective host. Importing only a host does not move an existing key to it.
+The same rule applies to saved self-hosted username/password credentials from
+older installations: a host-only import keeps them bound to the previous host.
+If that previous host is unknown, the import refuses the host change; configure
+the new host with fresh credentials through Settings instead.
+An export that includes the saved API key records its bound host, even when
+`UNIFI_HOST` overrides the database host. If an older saved key has no valid
+host binding, the API refuses to include it until the association is repaired.
 
 ## GeoIP / Threat intelligence
 
@@ -62,6 +127,14 @@ Retention cleanup runs in batches with `SKIP LOCKED` to avoid blocking ingestion
 | `PIHOLE_HOST` | *(empty)* | e.g. `http://pihole.lan:80` |
 | `PIHOLE_PASSWORD` | *(empty)* | Web UI password (used for the session-based API). |
 | `PIHOLE_POLL_INTERVAL` | `60` | Seconds between polls. |
+
+When `PIHOLE_PASSWORD` comes from the environment, set `PIHOLE_HOST` there too.
+Changing a saved Pi-hole address requires a new password. Connection tests
+cannot reuse the saved password for another address.
+
+Secret-bearing UniFi and Pi-hole requests do not follow HTTP redirects. A
+controller that relies on a redirect for its API must be configured with its
+final URL instead.
 
 AdGuard Home has an equivalent — configure it in Settings > Integrations after boot (no env vars).
 

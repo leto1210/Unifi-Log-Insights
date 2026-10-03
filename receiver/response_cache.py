@@ -12,6 +12,11 @@ one another. Cached values are deep-copied on both store and read, so a caller
 mutating a result (e.g. an annotation pass) can never poison a later hit.
 Exceptions are never cached.
 
+The store holds at most 256 responses (LRU eviction). This limits the number
+of distinct filter combinations retained, not their total byte size; callers
+must still bound individual response sizes. Expired entries are purged on
+insertion, including entries whose keys are never requested again.
+
 Test hooks: `clear_cache()` empties every bucket; `_cache` is the shared store.
 """
 
@@ -19,14 +24,19 @@ import copy
 import functools
 import threading
 import time
+from collections import OrderedDict
+
+
+_MAX_CACHE_ENTRIES = 256
 
 
 class _TTLCache:
-    """Thread-safe {key: (expires_at, value)} store with lazy expiry."""
+    """Thread-safe bounded LRU store of {key: (expires_at, value)} entries."""
 
-    def __init__(self):
-        """Initialise an empty store guarded by a lock."""
-        self._store = {}
+    def __init__(self, max_entries=_MAX_CACHE_ENTRIES):
+        """Initialise a bounded store guarded by a lock."""
+        self._store = OrderedDict()
+        self._max_entries = max_entries
         self._lock = threading.Lock()
 
     def get(self, key):
@@ -36,15 +46,23 @@ class _TTLCache:
             if entry is None:
                 return None
             expires_at, value = entry
-            if expires_at < time.monotonic():
+            if expires_at <= time.monotonic():
                 del self._store[key]
                 return None
+            self._store.move_to_end(key)
             return value
 
     def set(self, key, value, ttl):
-        """Store value under key for ttl seconds."""
+        """Purge expired values, then store one value with LRU eviction."""
         with self._lock:
-            self._store[key] = (time.monotonic() + ttl, value)
+            now = time.monotonic()
+            for expired_key, (expires_at, _) in tuple(self._store.items()):
+                if expires_at <= now:
+                    del self._store[expired_key]
+            self._store[key] = (now + ttl, value)
+            self._store.move_to_end(key)
+            while len(self._store) > self._max_entries:
+                self._store.popitem(last=False)
 
     def clear(self):
         """Empty every bucket."""

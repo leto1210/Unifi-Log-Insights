@@ -374,6 +374,42 @@ class TestSanitizeCsvCell:
         assert sanitize_csv_cell("-123.45") == "-123.45"
         assert sanitize_csv_cell("-.5") == "-.5"
 
+    @pytest.mark.parametrize('value', [
+        '-1+1', '-2/2', '-5*3', '-1e5', '-5.', '-.5+1',
+        '-1,2', '-1;2', '-１+1',
+    ])
+    def test_non_numeric_dash_values_sanitized(self, value):
+        assert sanitize_csv_cell(value) == "'" + value
+
+    @pytest.mark.parametrize('value', [
+        ' =1+1', '  +1+1', '\u00a0@SUM(1)', ' -1+1',
+        'plain\x1b=1', 'plain\x7f=1',
+    ])
+    def test_hidden_formula_or_control_sanitized(self, value):
+        assert sanitize_csv_cell(value) == "'" + value
+
+    def test_harmless_leading_space_preserved(self):
+        assert sanitize_csv_cell(' ordinary label ') == ' ordinary label '
+
+    @pytest.mark.parametrize(('value', 'expected'), [
+        ('label;=1+1', "label;'=1+1"),
+        ('label;  =1+1', "label;'  =1+1"),
+        ('label;-1+1', "label;'-1+1"),
+        ('label;-5;ordinary', 'label;-5;ordinary'),
+        ('label;ordinary', 'label;ordinary'),
+        ('label\t=1+1', "'label\t'=1+1"),
+        ('label\n=1+1', "'label\n'=1+1"),
+        ('label\r=1+1', "'label\r'=1+1"),
+        ('=1\n+2', "'=1\n'+2"),
+        ('-1\n=1', "'-1\n'=1"),
+    ])
+    def test_formula_after_alternate_delimiter(self, value, expected):
+        assert sanitize_csv_cell(value) == expected
+
+    def test_many_separators_only_quote_the_formula_segment(self):
+        value = 'label;' * 5000 + '=1+1'
+        assert sanitize_csv_cell(value) == 'label;' * 5000 + "'=1+1"
+
     def test_dash_dot_no_digit_sanitized(self):
         # "-." is not a negative number — gets sanitized
         assert sanitize_csv_cell("-.") == "'-."

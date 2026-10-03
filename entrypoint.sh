@@ -39,6 +39,12 @@ if [ ! -s "$PGDATA/PG_VERSION" ]; then
     su - postgres -c "psql -d unifi_logs -c \"ALTER TABLE logs OWNER TO unifi;\""
     su - postgres -c "psql -d unifi_logs -c \"ALTER TABLE ip_threats OWNER TO unifi;\""
     su - postgres -c "psql -d unifi_logs -c \"ALTER SEQUENCE logs_id_seq OWNER TO unifi;\""
+    # These init.sql tables are indexed or altered by receiver/db/core.py on
+    # first startup. IF NOT EXISTS still requires their owner for that DDL.
+    su - postgres -c "psql -d unifi_logs -c \"ALTER TABLE sessions OWNER TO unifi;\""
+    su - postgres -c "psql -d unifi_logs -c \"ALTER TABLE api_tokens OWNER TO unifi;\""
+    su - postgres -c "psql -d unifi_logs -c \"ALTER TABLE audit_log OWNER TO unifi;\""
+    su - postgres -c "psql -d unifi_logs -c \"ALTER TABLE threat_backfill_queue OWNER TO unifi;\""
     # Defensive: transfer ownership of app-created tables if they exist
     su - postgres -c "psql -d unifi_logs -c \"DO \\\$\\\$ BEGIN IF EXISTS (SELECT 1 FROM pg_tables WHERE tablename='system_config') THEN ALTER TABLE system_config OWNER TO unifi; END IF; END \\\$\\\$;\""
     su - postgres -c "psql -d unifi_logs -c \"DO \\\$\\\$ BEGIN IF EXISTS (SELECT 1 FROM pg_tables WHERE tablename='unifi_clients') THEN ALTER TABLE unifi_clients OWNER TO unifi; END IF; END \\\$\\\$;\""

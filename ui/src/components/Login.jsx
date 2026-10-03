@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { authLogin } from '../api'
+import { authLogin, authSetup } from '../api'
 
 const INPUT_CLS = 'w-full rounded-md border border-slate-200 bg-white px-4 py-3 text-sm text-slate-700 placeholder:text-slate-400 shadow-sm transition focus:border-teal-500 focus:outline-none focus:ring-2 focus:ring-teal-500/15 disabled:cursor-not-allowed disabled:bg-slate-100 disabled:text-slate-400'
 const DARK_INPUT_CLS = 'w-full rounded-md border border-zinc-800 bg-black px-4 py-3 text-sm text-zinc-100 placeholder:text-zinc-500 shadow-sm transition focus:border-teal-500 focus:outline-none focus:ring-2 focus:ring-teal-500/20 disabled:cursor-not-allowed disabled:bg-black/70 disabled:text-zinc-600'
@@ -8,9 +8,11 @@ const DARK_INPUT_CLS = 'w-full rounded-md border border-zinc-800 bg-black px-4 p
 // so isHttps is always true or false, never undefined. No guard needed.
 // Post-unmount state updates are harmless in React 18 (no warning).
 // PropTypes not used in this project.
-export default function Login({ onSuccess, isHttps, proxyTrusted, isEmbedded, theme, version }) {
+export default function Login({ onSuccess, isHttps, proxyTrusted, isEmbedded, theme, version, setupMode = false }) {
   const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
+  const [confirmPassword, setConfirmPassword] = useState('')
+  const [setupToken, setSetupToken] = useState('')
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(false)
   const [showPassword, setShowPassword] = useState(false)
@@ -20,12 +22,14 @@ export default function Login({ onSuccess, isHttps, proxyTrusted, isEmbedded, th
     e.preventDefault()
     // Password is intentionally not trimmed — leading/trailing whitespace may be
     // part of the password. Only username is trimmed.
-    if (!username.trim() || !password) return
+    if (!username.trim() || !password || (setupMode && (!setupToken || password !== confirmPassword))) return
     setError('')
     setLoading(true)
     try {
-      await authLogin(username.trim(), password)
-      onSuccess()
+      const result = setupMode
+        ? await authSetup(username.trim(), password, setupToken)
+        : await authLogin(username.trim(), password)
+      onSuccess(result)
     } catch (err) {
       setError(err.message || 'Login failed')
     } finally {
@@ -73,8 +77,8 @@ export default function Login({ onSuccess, isHttps, proxyTrusted, isEmbedded, th
 
             <div className="flex items-center px-6 py-8 sm:px-10 md:px-12">
               <div className="w-full max-w-md">
-                <h1 className={`text-[2rem] font-semibold tracking-tight ${isDark ? 'text-zinc-100' : 'text-slate-800'}`}>Login to your account</h1>
-                <p className={`mt-2 text-sm ${isDark ? 'text-zinc-400' : 'text-slate-500'}`}>Use your local Insights Plus credentials to continue.</p>
+                <h1 className={`text-[2rem] font-semibold tracking-tight ${isDark ? 'text-zinc-100' : 'text-slate-800'}`}>{setupMode ? 'Create the first administrator' : 'Login to your account'}</h1>
+                <p className={`mt-2 text-sm ${isDark ? 'text-zinc-400' : 'text-slate-500'}`}>{setupMode ? 'Enter the SETUP_TOKEN from your server configuration, then choose local credentials.' : 'Use your local Insights Plus credentials to continue.'}</p>
 
                 <form onSubmit={handleSubmit} className="mt-8">
                   <div className="space-y-5">
@@ -108,7 +112,7 @@ export default function Login({ onSuccess, isHttps, proxyTrusted, isEmbedded, th
                           placeholder="Password"
                           aria-label="Password"
                           disabled={!isHttps || loading}
-                          autoComplete="current-password"
+                          autoComplete={setupMode ? 'new-password' : 'current-password'}
                           className={`${isDark ? DARK_INPUT_CLS : INPUT_CLS} pr-10`}
                         />
                         <button type="button" disabled={!isHttps || loading} onClick={() => setShowPassword(v => !v)} aria-label={showPassword ? 'Hide password' : 'Show password'} className={`absolute inset-y-0 right-0 flex items-center pr-3 transition-colors ${isDark ? 'text-zinc-500 hover:text-zinc-300' : 'text-slate-400 hover:text-slate-600'} disabled:opacity-40 disabled:cursor-not-allowed`}>
@@ -120,7 +124,23 @@ export default function Login({ onSuccess, isHttps, proxyTrusted, isEmbedded, th
                         </button>
                       </div>
                     </div>
+                    {setupMode && (
+                      <>
+                        <div>
+                          <label htmlFor="setup-confirm-password" className={`mb-2 block text-sm font-semibold ${isDark ? 'text-zinc-200' : 'text-slate-700'}`}>Confirm password</label>
+                          <input id="setup-confirm-password" type="password" value={confirmPassword} onChange={e => setConfirmPassword(e.target.value)} autoComplete="new-password" className={isDark ? DARK_INPUT_CLS : INPUT_CLS} />
+                        </div>
+                        <div>
+                          <label htmlFor="setup-token" className={`mb-2 block text-sm font-semibold ${isDark ? 'text-zinc-200' : 'text-slate-700'}`}>Setup token</label>
+                          <input id="setup-token" type="password" value={setupToken} onChange={e => setSetupToken(e.target.value)} autoComplete="off" className={isDark ? DARK_INPUT_CLS : INPUT_CLS} />
+                        </div>
+                      </>
+                    )}
                   </div>
+
+                  {setupMode && password && confirmPassword && password !== confirmPassword && (
+                    <p className="mt-3 text-sm text-rose-400" role="alert">Passwords do not match.</p>
+                  )}
 
                   {error && (
                     <p className={`mt-4 rounded-md px-3 py-2 text-sm ${isDark ? 'border border-rose-500/30 bg-rose-500/10 text-rose-300' : 'border border-rose-200 bg-rose-50 text-rose-700'}`} role="alert">{error}</p>
@@ -128,10 +148,10 @@ export default function Login({ onSuccess, isHttps, proxyTrusted, isEmbedded, th
 
                   <button
                     type="submit"
-                    disabled={!isHttps || loading || !username.trim() || !password}
+                    disabled={!isHttps || loading || !username.trim() || !password || (setupMode && (!setupToken || password !== confirmPassword))}
                     className="mt-6 w-full rounded-md bg-teal-500 px-4 py-3 text-sm font-semibold text-white shadow-[0_12px_24px_rgba(20,184,166,0.22)] transition hover:bg-teal-400 disabled:cursor-not-allowed disabled:bg-slate-300 disabled:text-slate-500 disabled:shadow-none"
                   >
-                    {loading ? 'Signing in...' : 'Sign in'}
+                    {loading ? (setupMode ? 'Creating administrator...' : 'Signing in...') : (setupMode ? 'Create administrator' : 'Sign in')}
                   </button>
                 </form>
               </div>

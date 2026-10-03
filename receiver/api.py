@@ -217,7 +217,9 @@ class AuthMiddleware(BaseHTTPMiddleware):
             is_token = bool(auth_info.get('token_id'))
             if is_token:
                 # effective_scopes already computed by require_auth (token ∩ owner role)
-                scopes = auth_info.get('effective_scopes') or set(auth_info.get('scopes') or [])
+                effective_scopes = auth_info.get('effective_scopes')
+                scopes = (set(effective_scopes) if effective_scopes is not None
+                          else set(auth_info.get('scopes') or []))
 
                 # Token management is session-only — reject tokens entirely
                 if path.startswith('/api/tokens'):

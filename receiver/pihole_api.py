@@ -23,7 +23,9 @@ import requests
 import urllib3
 
 from db import encrypt_api_key, decrypt_api_key
-from service.integration_urls import normalize_integration_base_url
+from service.integration_urls import (
+    normalize_integration_base_url, same_integration_destination,
+)
 
 # Suppress InsecureRequestWarning process-wide. This affects ALL urllib3
 # callers, not just this module. Acceptable here because the only session
@@ -125,6 +127,7 @@ class PiHolePoller:
         self._poll_stop = threading.Event()
         self._lock = threading.Lock()
         self._lifecycle_lock = threading.RLock()
+        self._config_lock = threading.RLock()
         self._last_poll = None
         self._last_poll_error = None
 
@@ -168,14 +171,31 @@ class PiHolePoller:
 
         # Password: env var overrides encrypted DB value
         env_password = os.environ.get('PIHOLE_PASSWORD', '')
+        db_host = self._db.get_config('pihole_host', '')
+        saved_password_host = self._db.get_config('pihole_password_host', '')
+        if (not saved_password_host and db_host and
+                self._db.get_config('pihole_password', '')):
+            try:
+                self._db.set_config('pihole_password_host', db_host)
+                saved_password_host = db_host
+            except Exception:
+                logger.warning('Could not bind legacy Pi-hole password to its host')
+        try:
+            bound_to_db_host = (bool(saved_password_host) and
+                                same_integration_destination(
+                                    raw_host, saved_password_host, strip_admin_path=True))
+        except ValueError:
+            bound_to_db_host = False
         if env_password:
-            self._password = env_password
-        else:
+            self._password = env_password if os.environ.get('PIHOLE_HOST') else ''
+        elif bound_to_db_host:
             encrypted = self._db.get_config('pihole_password', '')
             if encrypted:
                 self._password = decrypt_api_key(encrypted)
             else:
                 self._password = ''
+        else:
+            self._password = ''
 
         env_interval = os.environ.get('PIHOLE_POLL_INTERVAL', '')
         try:
@@ -229,6 +249,13 @@ class PiHolePoller:
 
     def reload_config(self):
         """Re-read settings from DB/env. Restart polling if host/enabled changed."""
+        with self._config_lock:
+            restart = self._reload_config_locked()
+        if restart:
+            self.start_polling()
+
+    def _reload_config_locked(self):
+        """Reload the host and credential while outbound requests are excluded."""
         old_host = self.host
         old_enabled = self.enabled
 
@@ -262,8 +289,8 @@ class PiHolePoller:
 
         # Restart polling if it was running or if newly enabled
         was_polling = self._poll_thread is not None and self._poll_thread.is_alive()
-        if was_polling or (self.enabled and (old_host != self.host or old_enabled != self.enabled)):
-            self.start_polling()
+        return was_polling or (self.enabled and (
+            old_host != self.host or old_enabled != self.enabled))
 
     _ENV_MAP = {
         'host': 'PIHOLE_HOST',
@@ -335,6 +362,7 @@ class PiHolePoller:
         """Lazily create a requests.Session."""
         if self._session is None:
             self._session = requests.Session()
+            self._session.max_redirects = 0
             self._session.verify = False  # Pi-hole typically uses self-signed certs
         return self._session
 
@@ -425,23 +453,26 @@ class PiHolePoller:
 
         Auto-retries once on 401 (expired/invalid SID).
         """
-        self._ensure_auth()
-        session = self._get_session()
-        url = f"{self.host}{path}"
-        headers = {"sid": self._sid}
+        # Snapshot under the lock; run the HTTP round-trip outside it so a slow
+        # Pi-hole cannot stall Settings saves or reload_config().
+        with self._config_lock:
+            self._ensure_auth()
+            session, url, sid = self._get_session(), f"{self.host}{path}", self._sid
 
         try:
-            resp = session.get(url, params=params, headers=headers, timeout=self.TIMEOUT)
+            resp = session.get(url, params=params, headers={"sid": sid}, timeout=self.TIMEOUT)
         except requests.RequestException as e:
             raise ConnectionError(f"Pi-hole API request failed: {e}") from e
 
         # Retry once on 401 (SID may have been invalidated server-side)
         if resp.status_code == 401:
             logger.debug("Pi-hole returned 401, re-authenticating")
-            self._sid = None
-            self._authenticate()
-            headers = {"sid": self._sid}
-            resp = session.get(url, params=params, headers=headers, timeout=self.TIMEOUT)
+            with self._config_lock:
+                if self._sid == sid:
+                    self._sid = None
+                self._ensure_auth()
+                session, url, sid = self._get_session(), f"{self.host}{path}", self._sid
+            resp = session.get(url, params=params, headers={"sid": sid}, timeout=self.TIMEOUT)
 
         resp.raise_for_status()
         return resp.json()
@@ -843,8 +874,19 @@ class PiHolePoller:
         Can be called with explicit host/password (from Settings wizard)
         or uses stored config.
         """
-        raw_host = host or self.host
-        test_password = password or self._password
+        with self._config_lock:
+            configured_host, saved_password = self.host, self._password
+        raw_host = host or configured_host
+        if not password and host:
+            try:
+                same_host = bool(configured_host) and same_integration_destination(
+                    raw_host, configured_host, strip_admin_path=True)
+            except ValueError:
+                same_host = False
+            if not same_host:
+                return {'success': False, 'error':
+                        'Saved password can only be tested against its configured host'}
+        test_password = password or saved_password
 
         if not raw_host or not test_password:
             return {'success': False, 'error': 'Host and password are required'}
@@ -856,6 +898,7 @@ class PiHolePoller:
             return {'success': False, 'error': str(e)}
 
         session = requests.Session()
+        session.max_redirects = 0
         session.verify = False
 
         try:

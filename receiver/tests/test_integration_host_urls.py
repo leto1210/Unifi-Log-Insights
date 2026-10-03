@@ -100,10 +100,9 @@ def test_pihole_settings_persist_normalized_real_host(mocked_settings_deps):
         'enrichment': 'both',
     }) == {'success': True}
 
-    mock_db.set_config.assert_has_calls([
-        call(mock_deps.enricher_db, 'pihole_host', 'http://pihole.home.arpa'),
-        call(mock_deps.enricher_db, 'pihole_last_cursor', 0),
-    ], any_order=True)
+    (updates,), = [c.args for c in mock_deps.enricher_db.set_config_many.call_args_list]
+    assert updates['pihole_host'] == 'http://pihole.home.arpa'
+    assert updates['pihole_last_cursor'] == 0
 
 
 def test_adguard_settings_persist_normalized_real_host(mocked_settings_deps):
