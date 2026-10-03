@@ -38,9 +38,12 @@ RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-reco
 # Install geoipupdate from MaxMind
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl \
     && ARCH=$(dpkg --print-architecture) \
-    && curl -sSL "https://github.com/maxmind/geoipupdate/releases/download/v7.1.1/geoipupdate_7.1.1_linux_${ARCH}.deb" -o /tmp/geoipupdate.deb \
-    && dpkg -i /tmp/geoipupdate.deb \
-    && rm /tmp/geoipupdate.deb \
+    && curl -fsSL "https://github.com/maxmind/geoipupdate/releases/download/v8.0.0/geoipupdate_8.0.0_checksums.txt" -o /tmp/geoipupdate-checksums.txt \
+    && echo "dca871f8c852d7e4c50f4379a527d6cb7047e438caf94727a2bbe42f7d33d21b  /tmp/geoipupdate-checksums.txt" | sha256sum -c - \
+    && curl -fsSL "https://github.com/maxmind/geoipupdate/releases/download/v8.0.0/geoipupdate_8.0.0_linux_${ARCH}.deb" -o "/tmp/geoipupdate_8.0.0_linux_${ARCH}.deb" \
+    && (cd /tmp && sha256sum -c geoipupdate-checksums.txt --ignore-missing) \
+    && dpkg -i "/tmp/geoipupdate_8.0.0_linux_${ARCH}.deb" \
+    && rm /tmp/geoipupdate_8.0.0_linux_*.deb /tmp/geoipupdate-checksums.txt \
     && apt-get remove -y curl \
     && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/*
