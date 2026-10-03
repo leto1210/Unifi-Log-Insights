@@ -12,7 +12,8 @@
 #   --force  Bypass the freshness guard and download unconditionally.
 
 LOG_PREFIX="[geoip-update]"
-DB_DIR="/app/maxmind"
+# GEOIP_DB_DIR exists only so tests can point the script at a temp directory.
+DB_DIR="${GEOIP_DB_DIR:-/app/maxmind}"
 MIN_INTERVAL_HOURS="${GEOIP_MIN_UPDATE_INTERVAL_HOURS:-12}"
 
 FORCE=0
@@ -49,6 +50,14 @@ if [ "$FORCE" -ne 1 ]; then
             exit 0
         fi
     fi
+fi
+
+# Fail before downloading: geoipupdate fetches each edition (and retries) before
+# it tries to install it, so an unwritable directory would burn MaxMind's daily
+# download quota on every run and never update anything.
+if [ ! -d "$DB_DIR" ] || [ ! -w "$DB_DIR" ]; then
+    echo "$LOG_PREFIX ERROR: $DB_DIR is not writable by $(id -un); fix its permissions (chmod u+rwX) before updating. Nothing was downloaded."
+    exit 1
 fi
 
 echo "$LOG_PREFIX Starting GeoLite2 database update..."
