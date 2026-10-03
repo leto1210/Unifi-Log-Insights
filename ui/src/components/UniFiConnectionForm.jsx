@@ -1,5 +1,6 @@
 import { useState, useRef, useEffect } from 'react'
 import { testUniFiConnection } from '../api'
+import { sameIntegrationHost } from '../lib/integrationHost'
 
 function normalizeHost(raw) {
   const h = raw.trim()
@@ -30,12 +31,8 @@ export default function UniFiConnectionForm({
   const timeoutRef = useRef(null)
 
   const isSelfHosted = controllerType === 'self_hosted'
-  const hostChanged = !!savedHost &&
-    normalizeHost(host).replace(/\/+$/, '').toLowerCase() !==
-    normalizeHost(savedHost).replace(/\/+$/, '').toLowerCase()
-  const envHostMismatch = !!(envApiKey && envHost) &&
-    normalizeHost(host).replace(/\/+$/, '').toLowerCase() !==
-    normalizeHost(envHost).replace(/\/+$/, '').toLowerCase()
+  const hostChanged = !!savedHost && !sameIntegrationHost(host, savedHost)
+  const envHostMismatch = !!(envApiKey && envHost) && !sameIntegrationHost(host, envHost)
 
   // Cleanup timeout on unmount
   useEffect(() => {

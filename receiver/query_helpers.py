@@ -441,48 +441,28 @@ def validate_view_filters(filters: dict) -> str | None:
 
 # ── CSV export sanitization ─────────────────────────────────────────────────
 
-_CSV_FORMULA_PREFIXES = ('=', '+', '@', ';', '\t', '\r', '\n', '\0')
-_CSV_NEGATIVE_NUMBER = re.compile(r'-(?:[0-9]+(?:\.[0-9]+)?|\.[0-9]+)\Z')
-_CSV_NEGATIVE_FIELD = re.compile(r'-(?:[0-9]+(?:\.[0-9]+)?|\.[0-9]+)(?=$|[;\x00-\x1f\x7f])')
-_CSV_ALT_SEPARATORS = ';\t\r\n'
+# A negative number is harmless as a whole field: digits, optional fraction,
+# then end of text or a control/separator character.
+_CSV_NEGATIVE_BODY = r'-(?:[0-9]+(?:\.[0-9]+)?|\.[0-9]+)'
+_CSV_NEGATIVE_NUMBER = re.compile(_CSV_NEGATIVE_BODY + r'\Z')
+# What a spreadsheet reads as a formula at the start of a field.
+_CSV_FORMULA_START = rf'(?:[=+@;\x00]|(?!{_CSV_NEGATIVE_BODY}(?=$|[;\x00-\x1f\x7f]))-)'
+_CSV_LEADING_FORMULA = re.compile(rf'\s*{_CSV_FORMULA_START}')
+# An importer using ';' or tab can split a comma-CSV cell into new cells; a
+# CRLF pair is one record break, so only its LF half starts a new field.
+_CSV_AFTER_SEPARATOR = re.compile(rf'([;\t\n]|\r(?!\n))(?=\s*{_CSV_FORMULA_START})')
+_CSV_CONTROL = re.compile(r'[\x00-\x1f\x7f]')
 # Fast path: no formula/whitespace/dash lead, no separator or control character.
 _CSV_PLAIN = re.compile(r'[^=+@\-\s\x00-\x1f\x7f;][^;\x00-\x1f\x7f]*')
-
-
-def _csv_formula_at(value: str, index: int) -> bool:
-    """Check a field start without copying the rest of a potentially long cell."""
-    if index == len(value):
-        return False
-    if value[index] == '-':
-        return not _CSV_NEGATIVE_FIELD.match(value, index)
-    return value[index] in _CSV_FORMULA_PREFIXES
-
-
-def _starts_csv_formula(value: str) -> bool:
-    """Detect a formula after optional whitespace, except plain negative fields."""
-    first = value.lstrip()
-    return _csv_formula_at(first, 0)
 
 
 def sanitize_csv_cell(value: str) -> str:
     """Quote formulas, including cells re-split by a different CSV delimiter."""
     if not value or _CSV_PLAIN.fullmatch(value):
         return value
-    # An importer using ';' or tabs can split a comma-CSV cell into new cells.
-    # Quote the new cell's formula marker after each possible separator too.
-    length = len(value)
-    next_content = [length] * (length + 1)
-    for index in range(length - 1, -1, -1):
-        next_content[index] = (next_content[index + 1] if value[index].isspace()
-                               else index)
-    escaped = ''.join(
-        ch + ("'" if ch in _CSV_ALT_SEPARATORS and
-              _csv_formula_at(value, next_content[index + 1]) else '')
-        for index, ch in enumerate(value)
-    )
-    if (_starts_csv_formula(value) or
-            (value.lstrip().startswith('-') and
-             not _CSV_NEGATIVE_NUMBER.fullmatch(value)) or
-            any(ord(ch) < 32 or ord(ch) == 127 for ch in value)):
+    escaped = _CSV_AFTER_SEPARATOR.sub(r"\1'", value)
+    if (_CSV_LEADING_FORMULA.match(value) or
+            (value.lstrip().startswith('-') and not _CSV_NEGATIVE_NUMBER.fullmatch(value)) or
+            _CSV_CONTROL.search(value)):
         return "'" + escaped
     return escaped

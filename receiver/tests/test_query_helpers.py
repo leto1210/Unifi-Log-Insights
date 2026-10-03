@@ -402,6 +402,7 @@ class TestSanitizeCsvCell:
         ('label\r=1+1', "'label\r'=1+1"),
         ('=1\n+2', "'=1\n'+2"),
         ('-1\n=1', "'-1\n'=1"),
+        ('a\r\n=1', "'a\r\n'=1"),  # CRLF is one record break: quote once, after LF
     ])
     def test_formula_after_alternate_delimiter(self, value, expected):
         assert sanitize_csv_cell(value) == expected
