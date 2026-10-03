@@ -1,0 +1,70 @@
+# .understandignore — patterns for files/dirs to exclude from analysis
+# Syntax: same as .gitignore (globs, # comments, ! negation, trailing / for dirs)
+# Lines below are suggestions — uncomment to activate.
+# Use ! prefix to force-include something excluded by defaults.
+#
+# Built-in defaults (always excluded unless negated):
+#   node_modules/, .git/, dist/, build/, obj/, *.lock, *.min.js, etc.
+#
+# --- From .gitignore (uncomment to exclude) ---
+
+# .env
+# .env.local
+# maxmind/
+# *.pyc
+# *.pyo
+# .pytest_cache/
+# receiver/.pytest_cache/
+# htmlcov/
+# .coverage
+# ui/node_modules/
+# ui/dist/
+# extension/dist/
+# .DS_Store
+# Thumbs.db
+# queries.sql
+# issues.md
+# .claude
+# claude.md
+# CLAUDE.md
+# CLAUDE-architecture.md
+# CLAUDE-database.md
+# CLAUDE-parsers.md
+# CLAUDE-browser-ext.md
+# skills.md
+# agents.md
+# !/AGENTS.md
+# .doc
+# .worktrees/
+# unifi_logs_backup.dump
+# nul
+# null
+# Google_AI_Studio_2026-02-19T17_54_58.651Z.png
+# docker-compose.yml
+# docker-compose.test-external-db.yml
+# config-export.json
+# CLAUDE.md
+# .coderabbit.yaml
+# pull_logs.py
+# pull_logs_state.json
+# CLAUDE-ui-guidelines.md
+# pentest-results/
+# receiver/.pentest-deps/
+# receiver/uli_pentest/
+# receiver/pentest_cleanup.py
+# receiver/tests/test_uli_pentest_helpers.py
+# receiver/tests/test_config_import_types.py
+# docs/pentest-agent-harness.md
+# tasks/
+# .security-scan/
+
+# --- Detected directories (uncomment to exclude) ---
+
+# docs/
+# scripts/
+
+# --- Test file patterns (uncomment to exclude) ---
+
+# *.test.*
+# *.spec.*
+# *.snap
