@@ -84,6 +84,10 @@ echo "[entrypoint] Starting services via supervisord..."
 # Needed whenever a host bind mount (./maxmind:/app/maxmind, log dirs) lands
 # with a UID other than 1000; without this, receiver/cron would get EACCES.
 chown -R uli:uli /app/maxmind /var/log/geoip-update.log 2>/dev/null || true
+# A read-only mode on the bind-mounted directory (e.g. 555 left by a host-side
+# chmod) makes every geoipupdate run download the databases and then fail to
+# install them, burning MaxMind's daily download quota for nothing.
+chmod -R u+rwX /app/maxmind 2>/dev/null || true
 
 # If the operator mounted TLS materials for external Postgres at /certs
 # (DB_SSLCERT / DB_SSLKEY / DB_SSLROOTCERT), libpq must be able to read them
