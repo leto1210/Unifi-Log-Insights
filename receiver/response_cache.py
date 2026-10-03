@@ -15,7 +15,8 @@ Exceptions are never cached.
 The store holds at most 256 responses (LRU eviction). This limits the number
 of distinct filter combinations retained, not their total byte size; callers
 must still bound individual response sizes. Expired entries are purged on
-insertion, including entries whose keys are never requested again.
+insertion (scanned at most once per second), including entries whose keys
+are never requested again.
 
 Test hooks: `clear_cache()` empties every bucket; `_cache` is the shared store.
 """
@@ -28,6 +29,7 @@ from collections import OrderedDict
 
 
 _MAX_CACHE_ENTRIES = 256
+_SWEEP_INTERVAL = 1.0  # seconds between full scans for expired entries
 
 
 class _TTLCache:
@@ -37,6 +39,7 @@ class _TTLCache:
         """Initialise a bounded store guarded by a lock."""
         self._store = OrderedDict()
         self._max_entries = max_entries
+        self._next_sweep = 0.0
         self._lock = threading.Lock()
 
     def get(self, key):
@@ -53,12 +56,16 @@ class _TTLCache:
             return value
 
     def set(self, key, value, ttl):
-        """Purge expired values, then store one value with LRU eviction."""
+        """Store one value with LRU eviction, sweeping expired ones at most once per second."""
         with self._lock:
             now = time.monotonic()
-            for expired_key, (expires_at, _) in tuple(self._store.items()):
-                if expires_at <= now:
-                    del self._store[expired_key]
+            if now >= self._next_sweep:
+                # The scan is O(entries); throttling it keeps bursts of cache
+                # misses from repeatedly walking the store under the lock.
+                self._next_sweep = now + _SWEEP_INTERVAL
+                for expired_key, (expires_at, _) in tuple(self._store.items()):
+                    if expires_at <= now:
+                        del self._store[expired_key]
             self._store[key] = (now + ttl, value)
             self._store.move_to_end(key)
             while len(self._store) > self._max_entries:
@@ -68,6 +75,7 @@ class _TTLCache:
         """Empty every bucket."""
         with self._lock:
             self._store.clear()
+            self._next_sweep = 0.0
 
 
 _cache = _TTLCache()

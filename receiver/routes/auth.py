@@ -220,20 +220,29 @@ def _require_https(request: Request):
         raise HTTPException(403, "Authentication requires HTTPS. Please access the app through a reverse proxy with TLS enabled.")
 
 
+def _sync_auth_flag() -> bool:
+    """Report whether an admin exists, turning the DB auth flag on if it is stale.
+
+    AUTH_ENABLED=true with an admin in the DB but a stale flag (e.g. toggled
+    off then on) is synced here so the setup form is not shown again.
+    """
+    if not _has_admin():
+        return False
+    set_config(enricher_db, 'auth_enabled', True)
+    logger.info("Auto-enabled auth: AUTH_ENABLED=true and admin user exists in DB")
+    return True
+
+
 def _auth_enabled() -> bool:
-    """Report whether authentication is required by this deployment."""
+    """Report whether authentication is required by this deployment.
+
+    An incomplete installation is protected too: the DB flag is only set after
+    the first admin is created and must never open the API meanwhile.
+    """
     if not AUTH_ENABLED:
         return False
-    enabled = bool(get_config(enricher_db, 'auth_enabled', False))
-    if not enabled and _has_admin():
-        # AUTH_ENABLED env var is true and an admin exists, but the DB flag
-        # is stale (e.g. toggled off then on).  Auto-sync to avoid showing
-        # the setup form again.
-        set_config(enricher_db, 'auth_enabled', True)
-        logger.info("Auto-enabled auth: AUTH_ENABLED=true and admin user exists in DB")
-        return True
-    # An incomplete installation is protected too. The DB flag is only set
-    # after the first admin is created; it must never open the API meanwhile.
+    if not bool(get_config(enricher_db, 'auth_enabled', False)):
+        _sync_auth_flag()
     return True
 
 
@@ -499,21 +508,15 @@ def require_auth(request: Request) -> dict | None:
     # request. The admin-existence check only runs on the rare cold path
     # below (first boot, or a DB flag that hasn't caught up yet).
     if not bool(get_config(enricher_db, 'auth_enabled', False)):
-        if _has_admin():
-            # Admin exists but the DB flag is stale (e.g. toggled off then on,
-            # or this is the first request after enrollment) — sync it so this
-            # cold path isn't repeated on every subsequent request.
-            set_config(enricher_db, 'auth_enabled', True)
-            logger.info("Auto-enabled auth: AUTH_ENABLED=true and admin user exists in DB")
-        elif not _has_users():
+        if not _sync_auth_flag() and not _has_users():
             # Enrollment mode: nobody can authenticate yet, so only the
             # endpoints needed to create the first admin are reachable.
             if path in BOOTSTRAP_PATHS:
                 return None
             raise HTTPException(401, "Administrator enrollment required")
-        # else: active users but no admin. Regular authentication below still
-        # applies (sessions/tokens required, viewer stays read-only), so
-        # existing users can sign in; nothing is opened to anonymous callers.
+        # Otherwise an admin exists (flag now synced) or active users exist
+        # without one: regular authentication below applies (sessions/tokens
+        # required, viewer stays read-only), nothing opens to anonymous callers.
 
     if path in PUBLIC_PATHS or any(path.startswith(p) for p in PUBLIC_PREFIXES):
         return None

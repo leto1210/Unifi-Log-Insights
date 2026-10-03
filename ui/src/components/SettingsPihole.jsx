@@ -2,6 +2,7 @@ import { useState, useEffect, useMemo, useCallback, useRef } from 'react'
 import { fetchPiholeSettings, updatePiholeSettings, testPiholeConnection } from '../api'
 import InfoTooltip from './InfoTooltip'
 import piholeLogo from '../assets/pihole-logo.png'
+import { sameIntegrationHost } from '../lib/integrationHost'
 
 const INPUT_CLS = 'w-full px-3 py-1.5 bg-black border border-gray-700 rounded text-sm text-gray-200 placeholder-gray-500 focus:outline-none focus:border-teal-500 focus:ring-2 focus:ring-teal-500/20'
 
@@ -78,8 +79,7 @@ export default function SettingsPihole() {
   }, [settings, draft])
 
   const hostChanged = !!settings && !!draft &&
-    (draft.host || '').trim().replace(/\/+$/, '').toLowerCase() !==
-    (settings.host || '').trim().replace(/\/+$/, '').toLowerCase()
+    !sameIntegrationHost(draft.host, settings.host, { defaultScheme: 'http', stripAdminPath: true })
 
   // Block save if enabling without a host configured
   const canSave = hasChanges && (!needsTest || testPassed)

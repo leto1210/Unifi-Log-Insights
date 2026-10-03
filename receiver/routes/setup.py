@@ -528,6 +528,65 @@ def export_config(request: Request, include_api_key: bool = False):
     }
 
 
+def _bind_legacy_unifi_secrets(config: dict) -> tuple[bool, bool]:
+    """Bind legacy UniFi secrets to their current host before a host import.
+
+    Otherwise reload_config() could bind them to the imported host. Returns
+    (key_blocked, credentials_blocked): True when a legacy secret exists but
+    no old host is known to bind it to, so the host cannot change safely.
+    """
+    old_host = get_config(enricher_db, 'unifi_host', '')
+
+    def bind(has_secret, host_key):
+        """Bind one secret to old_host; True when it cannot be bound."""
+        if not has_secret or get_config(enricher_db, host_key, ''):
+            return False
+        if not old_host:
+            return True
+        set_config(enricher_db, host_key, old_host)
+        return False
+
+    key_blocked = bind(get_config(enricher_db, _API_KEY_CONFIG_KEY, ''),
+                       'unifi_api_key_host')
+    credentials_blocked = bind(get_config(enricher_db, 'unifi_username', '') or
+                               get_config(enricher_db, 'unifi_password', ''),
+                               'unifi_credentials_host')
+    return key_blocked, credentials_blocked
+
+
+def _import_unifi_api_key(config: dict, deferred_host, imported_keys: list, failed_keys: list):
+    """Re-encrypt an imported UniFi API key and store it with its bound host.
+
+    deferred_host is the host that must be written together with a legacy key
+    that had no known old host (a complete key+host pair), else None.
+    """
+    env_host = os.environ.get('UNIFI_HOST')
+    key_host = env_host or deferred_host or get_config(enricher_db, 'unifi_host', '')
+    outcome = [_API_KEY_CONFIG_KEY] + (['unifi_host'] if deferred_host is not None else [])
+    try:
+        # Reject a backup for a different controller when the environment
+        # overrides its host. The imported key must follow the effective
+        # destination, never a stale DB host.
+        normalize_integration_base_url(key_host)
+        if env_host and ('unifi_host' in imported_keys or deferred_host is not None):
+            if not same_integration_destination(env_host, config['unifi_host']):
+                raise ValueError('Imported host differs from UNIFI_HOST')
+    except (TypeError, ValueError):
+        failed_keys.extend(outcome)
+        return
+    try:
+        updates = {_API_KEY_CONFIG_KEY: encrypt_api_key(config[_API_KEY_CONFIG_KEY]),
+                   'unifi_api_key_host': key_host}
+        if deferred_host is not None:
+            updates['unifi_host'] = deferred_host
+        enricher_db.set_config_many(updates)
+    except Exception as e:
+        logger.warning("Failed to encrypt imported API key: %s", e)
+        failed_keys.extend(outcome)
+    else:
+        imported_keys.extend(outcome)
+
+
 @router.post("/api/config/import")
 def import_config(body: dict):
     """Import configuration from a previously exported JSON.
@@ -541,25 +600,8 @@ def import_config(body: dict):
 
     imported_keys = []
     failed_keys = []
-    # Bind legacy secrets to their original host before importing a different
-    # one; otherwise reload_config() could bind them to the imported host.
-    key_host_change_blocked = False
-    credentials_host_change_blocked = False
-    if 'unifi_host' in config:
-        old_host = get_config(enricher_db, 'unifi_host', '')
-        if (get_config(enricher_db, _API_KEY_CONFIG_KEY, '') and
-                not get_config(enricher_db, 'unifi_api_key_host', '')):
-            if old_host:
-                set_config(enricher_db, 'unifi_api_key_host', old_host)
-            else:
-                key_host_change_blocked = True
-        if ((get_config(enricher_db, 'unifi_username', '') or
-             get_config(enricher_db, 'unifi_password', '')) and
-                not get_config(enricher_db, 'unifi_credentials_host', '')):
-            if old_host:
-                set_config(enricher_db, 'unifi_credentials_host', old_host)
-            else:
-                credentials_host_change_blocked = True
+    key_host_change_blocked, credentials_host_change_blocked = (
+        _bind_legacy_unifi_secrets(config) if 'unifi_host' in config else (False, False))
     # A legacy key with no known old host can only be replaced as a complete
     # key+host pair. Credentials with no known old host cannot follow either.
     deferred_host = (config['unifi_host'] if key_host_change_blocked and
@@ -628,37 +670,8 @@ def import_config(body: dict):
         imported_keys.append(key)
 
     # Handle API key separately — re-encrypt for storage
-    if _API_KEY_CONFIG_KEY in config and config[_API_KEY_CONFIG_KEY]:
-        env_host = os.environ.get('UNIFI_HOST')
-        key_host = env_host or deferred_host or get_config(enricher_db, 'unifi_host', '')
-        try:
-            # Reject a backup for a different controller when the environment
-            # overrides its host. The imported key must follow the effective
-            # destination, never a stale DB host.
-            normalize_integration_base_url(key_host)
-            if env_host and ('unifi_host' in imported_keys or deferred_host is not None):
-                if not same_integration_destination(env_host, config['unifi_host']):
-                    raise ValueError('Imported host differs from UNIFI_HOST')
-        except (TypeError, ValueError):
-            failed_keys.append(_API_KEY_CONFIG_KEY)
-            if deferred_host is not None:
-                failed_keys.append('unifi_host')
-        else:
-            try:
-                encrypted = encrypt_api_key(config[_API_KEY_CONFIG_KEY])
-                updates = {_API_KEY_CONFIG_KEY: encrypted,
-                           'unifi_api_key_host': key_host}
-                if deferred_host is not None:
-                    updates['unifi_host'] = deferred_host
-                enricher_db.set_config_many(updates)
-                imported_keys.append(_API_KEY_CONFIG_KEY)
-                if deferred_host is not None:
-                    imported_keys.append('unifi_host')
-            except Exception as e:
-                logger.warning("Failed to encrypt imported API key: %s", e)
-                failed_keys.append(_API_KEY_CONFIG_KEY)
-                if deferred_host is not None:
-                    failed_keys.append('unifi_host')
+    if config.get(_API_KEY_CONFIG_KEY):
+        _import_unifi_api_key(config, deferred_host, imported_keys, failed_keys)
 
     # Import saved views (if present)
     failed_saved_views = []
