@@ -59,14 +59,45 @@ def test_unifi_saved_key_accepts_equivalent_host(unifi_route):
     deps.unifi_api.test_connection.assert_called_once()
 
 
-def test_unifi_explicit_new_key_clears_old_key_before_host_change(unifi_route):
-    """A host edit clears the old key before a new destination is saved."""
-    route, _, db = unifi_route
+def test_unifi_explicit_new_key_replaces_old_key_atomically(unifi_route):
+    """A host edit swaps host, binding and key in ONE transaction."""
+    route, deps, db = unifi_route
     route.update_unifi_settings({'host': 'https://other.lan', 'api_key': 'new-key'})
-    calls = [(args[1], args[2]) for args, _ in db.set_config.call_args_list]
-    assert calls.index(('unifi_api_key', '')) < calls.index(('unifi_host', 'https://other.lan'))
-    assert calls.index(('unifi_api_key_host', 'https://other.lan')) < calls.index(
-        ('unifi_api_key', 'new-cipher'))
+    db.set_config.assert_not_called()
+    (updates,), = [c.args for c in deps.enricher_db.set_config_many.call_args_list]
+    assert updates['unifi_host'] == 'https://other.lan'
+    assert updates['unifi_api_key_host'] == 'https://other.lan'
+    assert updates['unifi_api_key'] == 'new-cipher'
+    # the unrelated old login is wiped, the new key overwrites the old one
+    assert updates['unifi_username'] == '' and updates['unifi_password'] == ''
+
+
+def test_unifi_put_failure_keeps_old_secrets(unifi_route):
+    """An encryption failure must not leave a half-applied host change."""
+    route, deps, db = unifi_route
+    db.encrypt_api_key.side_effect = RuntimeError('boom')
+    with pytest.raises(RuntimeError):
+        route.update_unifi_settings({'host': 'https://other.lan', 'api_key': 'k'})
+    deps.enricher_db.set_config_many.assert_not_called()
+    db.set_config.assert_not_called()
+
+
+def test_unifi_put_empty_host_does_not_bind_key_to_empty_host(unifi_route):
+    """host='' must bind a new key to the stored host, never to ''."""
+    route, deps, db = unifi_route
+    route.update_unifi_settings({'host': '', 'api_key': 'new-key'})
+    (updates,), = [c.args for c in deps.enricher_db.set_config_many.call_args_list]
+    assert updates['unifi_api_key_host'] == 'https://controller.lan'
+
+
+def test_unifi_put_credentials_without_any_host_rejected(unifi_route):
+    """No host anywhere: refuse instead of storing an unusable binding."""
+    route, deps, db = unifi_route
+    db.get_config.side_effect = lambda _db, key, default='': default
+    with pytest.raises(HTTPException) as exc:
+        route.update_unifi_settings({'api_key': 'k'})
+    assert exc.value.status_code == 400
+    deps.enricher_db.set_config_many.assert_not_called()
 
 
 def test_pihole_omitted_password_cannot_move_to_another_host():
@@ -287,8 +318,8 @@ def test_pihole_env_password_requires_env_host(monkeypatch):
     assert poller.enabled is False
 
 
-def test_unifi_reload_waits_for_inflight_secret_bearing_request(monkeypatch):
-    """A reload cannot swap host while an authenticated request is in flight."""
+def test_unifi_reload_does_not_block_on_inflight_request_and_keeps_old_host(monkeypatch):
+    """A slow request must not stall reload, and must finish on its OLD host."""
     from unifi.core import UniFiAPI
     monkeypatch.delenv('UNIFI_HOST', raising=False)
     monkeypatch.delenv('UNIFI_API_KEY', raising=False)
@@ -329,7 +360,7 @@ def test_unifi_reload_waits_for_inflight_secret_bearing_request(monkeypatch):
         request = pool.submit(api._get, 'stat/sysinfo')
         assert entered.wait(2)
         pending_reload = pool.submit(reload)
-        assert not reloaded.wait(0.05)
+        assert reloaded.wait(1)  # reload is not blocked by the in-flight GET
         release.set()
         request.result(timeout=2)
         pending_reload.result(timeout=2)

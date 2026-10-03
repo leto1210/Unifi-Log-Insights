@@ -104,49 +104,48 @@ def _update_unifi_settings_locked(body: dict):
                                         not os.environ.get('UNIFI_HOST')):
                 raise HTTPException(400, 'New credentials are required when changing the UniFi host')
         body = {**body, 'host': new_host}
+    # Host every submitted secret is bound to: the host being saved, else the
+    # stored one. Never '' -- a key bound to '' could not match any host.
+    bound_host = body.get('host') or get_config(enricher_db, 'unifi_host', '')
+    secrets = [k for k in ('api_key', 'username', 'password') if body.get(k)]
+    if secrets and not bound_host:
+        raise HTTPException(400, 'A UniFi host is required to save credentials')
+
+    # One transaction: a failure (e.g. encryption) must not leave the old
+    # secrets wiped while the new host is already stored.
+    updates = {}
     if 'enabled' in body:
-        set_config(enricher_db, 'unifi_enabled', body['enabled'])
+        updates['unifi_enabled'] = body['enabled']
     if 'host' in body:
         if changed:
-            for secret_key in ('unifi_api_key', 'unifi_username', 'unifi_password'):
-                set_config(enricher_db, secret_key, '')
-        set_config(enricher_db, 'unifi_host', body['host'])
+            updates.update({'unifi_api_key': '', 'unifi_username': '', 'unifi_password': ''})
+        updates['unifi_host'] = body['host']
     if 'controller_type' in body:
-        set_config(enricher_db, 'unifi_controller_type', body['controller_type'])
-    if 'api_key' in body:
-        key_val = body['api_key']
-        if key_val == '':
-            set_config(enricher_db, 'unifi_api_key', '')
-        elif key_val is not None:
-            set_config(enricher_db, 'unifi_api_key_host', body.get(
-                'host', get_config(enricher_db, 'unifi_host', '')))
-            set_config(enricher_db, 'unifi_api_key', encrypt_api_key(key_val))
-    if 'username' in body:
-        val = body['username']
+        updates['unifi_controller_type'] = body['controller_type']
+    if body.get('api_key') is not None:
+        if body['api_key'] == '':
+            updates['unifi_api_key'] = ''
+        else:
+            updates['unifi_api_key_host'] = bound_host
+            updates['unifi_api_key'] = encrypt_api_key(body['api_key'])
+    for field in ('username', 'password'):
+        val = body.get(field)
         if val == '':
-            set_config(enricher_db, 'unifi_username', '')
+            updates[f'unifi_{field}'] = ''
         elif val is not None:
-            set_config(enricher_db, 'unifi_credentials_host', body.get(
-                'host', get_config(enricher_db, 'unifi_host', '')))
-            set_config(enricher_db, 'unifi_username', encrypt_api_key(val))
-    if 'password' in body:
-        val = body['password']
-        if val == '':
-            set_config(enricher_db, 'unifi_password', '')
-        elif val is not None:
-            set_config(enricher_db, 'unifi_credentials_host', body.get(
-                'host', get_config(enricher_db, 'unifi_host', '')))
-            set_config(enricher_db, 'unifi_password', encrypt_api_key(val))
+            updates['unifi_credentials_host'] = bound_host
+            updates[f'unifi_{field}'] = encrypt_api_key(val)
     if 'site' in body:
-        set_config(enricher_db, 'unifi_site', body['site'])
+        updates['unifi_site'] = body['site']
         # Clear cached site_id — self-hosted must re-resolve on next request
-        set_config(enricher_db, 'unifi_site_id', None)
+        updates['unifi_site_id'] = None
     if 'verify_ssl' in body:
-        set_config(enricher_db, 'unifi_verify_ssl', body['verify_ssl'])
+        updates['unifi_verify_ssl'] = body['verify_ssl']
     if 'poll_interval' in body:
-        set_config(enricher_db, 'unifi_poll_interval', body['poll_interval'])
+        updates['unifi_poll_interval'] = body['poll_interval']
     if 'features' in body:
-        set_config(enricher_db, 'unifi_features', body['features'])
+        updates['unifi_features'] = body['features']
+    enricher_db.set_config_many(updates)
 
     return {"success": True}
 
@@ -154,8 +153,7 @@ def _update_unifi_settings_locked(body: dict):
 @router.post("/api/settings/unifi/test")
 def test_unifi_connection(body: dict):
     """Test connection AND save settings on success."""
-    with unifi_api._config_lock:
-        result = _test_unifi_connection_locked(body)
+    result = _test_unifi_connection(body)
     if result.get('success'):
         unifi_api.reload_config()
         _seed_network_identity()
@@ -163,8 +161,12 @@ def test_unifi_connection(body: dict):
     return result
 
 
-def _test_unifi_connection_locked(body: dict):
-    """Test and save a destination-bound credential under the client lock."""
+def _test_unifi_connection(body: dict):
+    """Test a connection, then save its destination-bound credential atomically.
+
+    The network probe runs outside the client lock (an unreachable controller
+    must not stall pollers or Settings); only the DB write-back takes it.
+    """
     try:
         host = normalize_integration_base_url(body.get('host', ''))
     except ValueError:
@@ -220,22 +222,25 @@ def _test_unifi_connection_locked(body: dict):
             username=username, password=password)
 
         if result.get('success'):
+            updates = {
+                'unifi_host': host,
+                'unifi_controller_type': 'self_hosted',
+                'unifi_site': site,
+                'unifi_verify_ssl': verify_ssl,
+                'unifi_controller_name': result.get('controller_name', ''),
+                'unifi_controller_version': result.get('version', ''),
+                'unifi_enabled': True,
+            }
             if not use_saved_credentials:
-                for secret_key in ('unifi_username', 'unifi_password'):
-                    set_config(enricher_db, secret_key, '')
-            set_config(enricher_db, 'unifi_host', host)
-            set_config(enricher_db, 'unifi_controller_type', 'self_hosted')
-            if not use_saved_credentials:
-                set_config(enricher_db, 'unifi_credentials_host', host)
-                set_config(enricher_db, 'unifi_username', encrypt_api_key(username))
-                set_config(enricher_db, 'unifi_password', encrypt_api_key(password))
+                updates.update({
+                    'unifi_credentials_host': host,
+                    'unifi_username': encrypt_api_key(username),
+                    'unifi_password': encrypt_api_key(password),
+                })
             if result.get('site_id'):
-                set_config(enricher_db, 'unifi_site_id', result['site_id'])
-            set_config(enricher_db, 'unifi_site', site)
-            set_config(enricher_db, 'unifi_verify_ssl', verify_ssl)
-            set_config(enricher_db, 'unifi_controller_name', result.get('controller_name', ''))
-            set_config(enricher_db, 'unifi_controller_version', result.get('version', ''))
-            set_config(enricher_db, 'unifi_enabled', True)
+                updates['unifi_site_id'] = result['site_id']
+            with unifi_api._config_lock:
+                enricher_db.set_config_many(updates)
 
     else:
         # UniFi OS: API key auth
@@ -264,18 +269,20 @@ def _test_unifi_connection_locked(body: dict):
             host, site, verify_ssl, controller_type='unifi_os', api_key=api_key)
 
         if result.get('success'):
+            updates = {
+                'unifi_host': host,
+                'unifi_controller_type': 'unifi_os',
+                'unifi_site': site,
+                'unifi_verify_ssl': verify_ssl,
+                'unifi_controller_name': result.get('controller_name', ''),
+                'unifi_controller_version': result.get('version', ''),
+                'unifi_enabled': True,
+            }
             if not use_env_key and not use_saved_key:
-                set_config(enricher_db, 'unifi_api_key', '')
-            set_config(enricher_db, 'unifi_host', host)
-            set_config(enricher_db, 'unifi_controller_type', 'unifi_os')
-            if not use_env_key and not use_saved_key:
-                set_config(enricher_db, 'unifi_api_key_host', host)
-                set_config(enricher_db, 'unifi_api_key', encrypt_api_key(api_key))
-            set_config(enricher_db, 'unifi_site', site)
-            set_config(enricher_db, 'unifi_verify_ssl', verify_ssl)
-            set_config(enricher_db, 'unifi_controller_name', result.get('controller_name', ''))
-            set_config(enricher_db, 'unifi_controller_version', result.get('version', ''))
-            set_config(enricher_db, 'unifi_enabled', True)
+                updates.update({'unifi_api_key_host': host,
+                                'unifi_api_key': encrypt_api_key(api_key)})
+            with unifi_api._config_lock:
+                enricher_db.set_config_many(updates)
 
     return result
 

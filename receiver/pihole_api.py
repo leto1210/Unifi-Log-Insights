@@ -453,28 +453,26 @@ class PiHolePoller:
 
         Auto-retries once on 401 (expired/invalid SID).
         """
+        # Snapshot under the lock; run the HTTP round-trip outside it so a slow
+        # Pi-hole cannot stall Settings saves or reload_config().
         with self._config_lock:
-            return self._api_get_locked(path, params)
-
-    def _api_get_locked(self, path: str, params: dict = None) -> dict:
-        """Perform an authenticated GET under the configuration lock."""
-        self._ensure_auth()
-        session = self._get_session()
-        url = f"{self.host}{path}"
-        headers = {"sid": self._sid}
+            self._ensure_auth()
+            session, url, sid = self._get_session(), f"{self.host}{path}", self._sid
 
         try:
-            resp = session.get(url, params=params, headers=headers, timeout=self.TIMEOUT)
+            resp = session.get(url, params=params, headers={"sid": sid}, timeout=self.TIMEOUT)
         except requests.RequestException as e:
             raise ConnectionError(f"Pi-hole API request failed: {e}") from e
 
         # Retry once on 401 (SID may have been invalidated server-side)
         if resp.status_code == 401:
             logger.debug("Pi-hole returned 401, re-authenticating")
-            self._sid = None
-            self._authenticate()
-            headers = {"sid": self._sid}
-            resp = session.get(url, params=params, headers=headers, timeout=self.TIMEOUT)
+            with self._config_lock:
+                if self._sid == sid:
+                    self._sid = None
+                self._ensure_auth()
+                session, url, sid = self._get_session(), f"{self.host}{path}", self._sid
+            resp = session.get(url, params=params, headers={"sid": sid}, timeout=self.TIMEOUT)
 
         resp.raise_for_status()
         return resp.json()

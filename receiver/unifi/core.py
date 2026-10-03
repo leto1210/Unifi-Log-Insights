@@ -302,77 +302,71 @@ class UniFiAPI:
 
     def _get(self, path, host=None, session=None):
         """GET from classic API."""
-        with self._config_lock:
-            return self._get_locked(path, host=host, session=session)
-
-    def _get_locked(self, path, host=None, session=None):
-        """Perform a classic API GET under the configuration lock."""
-        if host is not None and session is None and not same_integration_destination(host, self.host):
-            raise ValueError('A saved UniFi session cannot target another host')
-        h = host or self.host
-        s = session or self._get_session()
-        url = self._build_url(path, host=h)
+        s, url = self._prepare_get(path, host, session, integration=False)
         resp = s.get(url, timeout=self.TIMEOUT)
         # Re-auth on expired session (self-hosted only, persistent session only)
         if (self._controller_type == 'self_hosted' and session is None
                 and (resp.status_code in (401, 403) or self._is_login_required(resp))):
-            self._session = None
-            s = self._get_session()
+            with self._config_lock:
+                if self._session is s:
+                    self._session = None
+            s, url = self._prepare_get(path, host, session, integration=False)
             resp = s.get(url, timeout=self.TIMEOUT)
         resp.raise_for_status()
         return resp.json()
+
+    def _prepare_get(self, path, host, session, *, integration):
+        """Snapshot session + URL under the config lock, then release it.
+
+        The lock keeps the (host, credential) pair consistent against a
+        concurrent reload_config(); the HTTP round-trip itself runs outside it
+        so a slow controller cannot stall Settings saves or reloads. A request
+        already in flight finishes on the old session, which stays bound to
+        the old host.
+        """
+        with self._config_lock:
+            if host is not None and session is None and not same_integration_destination(host, self.host):
+                raise ValueError('A saved UniFi session cannot target another host')
+            if integration and self._controller_type == 'self_hosted':
+                raise NotImplementedError("Integration API not available on self-hosted controllers")
+            h = host or self.host
+            s = session or self._get_session()
+            if integration:
+                return s, f"{h}/proxy/network{path}"
+            return s, self._build_url(path, host=h)
 
     # ── Integration API Helpers ───────────────────────────────────────────────
 
     def _get_integration(self, path, host=None, session=None):
         """GET from integration API (no site prefix)."""
-        with self._config_lock:
-            return self._get_integration_locked(path, host=host, session=session)
-
-    def _get_integration_locked(self, path, host=None, session=None):
-        """Perform an integration API GET under the configuration lock."""
-        if host is not None and session is None and not same_integration_destination(host, self.host):
-            raise ValueError('A saved UniFi session cannot target another host')
-        if self._controller_type == 'self_hosted':
-            raise NotImplementedError("Integration API not available on self-hosted controllers")
-        h = host or self.host
-        s = session or self._get_session()
-        url = f"{h}/proxy/network{path}"
+        s, url = self._prepare_get(path, host, session, integration=True)
         resp = s.get(url, timeout=self.TIMEOUT)
         self._check_integration_permissions(resp)
         resp.raise_for_status()
         return resp.json()
 
+    def _site_request_target(self, path):
+        """Snapshot (session, URL) for a site-scoped integration call."""
+        with self._config_lock:
+            if self._controller_type == 'self_hosted':
+                raise NotImplementedError("Integration API not available on self-hosted controllers")
+            if not self._site_uuid:
+                self._discover_site_uuid()
+            return (self._get_session(),
+                    f"{self.host}/proxy/network/integration/v1/sites/{self._site_uuid}{path}")
+
     def _get_integration_site(self, path):
         """GET from integration API with site UUID prefix."""
-        with self._config_lock:
-            return self._get_integration_site_locked(path)
-
-    def _get_integration_site_locked(self, path):
-        """Perform a site GET under the configuration lock."""
-        if self._controller_type == 'self_hosted':
-            raise NotImplementedError("Integration API not available on self-hosted controllers")
-        if not self._site_uuid:
-            self._discover_site_uuid()
-        url = f"{self.host}/proxy/network/integration/v1/sites/{self._site_uuid}{path}"
-        resp = self._get_session().get(url, timeout=self.TIMEOUT)
+        s, url = self._site_request_target(path)
+        resp = s.get(url, timeout=self.TIMEOUT)
         self._check_integration_permissions(resp)
         resp.raise_for_status()
         return resp.json()
 
     def _patch_integration_site(self, path, body):
         """PATCH to integration API with site UUID prefix."""
-        with self._config_lock:
-            return self._patch_integration_site_locked(path, body)
-
-    def _patch_integration_site_locked(self, path, body):
-        """Perform a site PATCH under the configuration lock."""
-        if self._controller_type == 'self_hosted':
-            raise NotImplementedError("Integration API not available on self-hosted controllers")
-        if not self._site_uuid:
-            self._discover_site_uuid()
-        url = f"{self.host}/proxy/network/integration/v1/sites/{self._site_uuid}{path}"
-        resp = self._get_session().patch(url, json=body, timeout=self.TIMEOUT)
+        s, url = self._site_request_target(path)
+        resp = s.patch(url, json=body, timeout=self.TIMEOUT)
         self._check_integration_permissions(resp)
         resp.raise_for_status()
         return resp.json()

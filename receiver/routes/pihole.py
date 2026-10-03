@@ -5,7 +5,7 @@ import os
 
 from fastapi import APIRouter, HTTPException
 
-from db import get_config, set_config, encrypt_api_key
+from db import get_config, encrypt_api_key
 from deps import enricher_db, signal_receiver, pihole_poller
 from pihole_api import _validate_pihole_url
 from service.integration_urls import same_integration_destination
@@ -73,32 +73,34 @@ def _update_pihole_settings_locked(body: dict):
         if changed and (not body.get('password') or os.environ.get('PIHOLE_PASSWORD')):
             raise HTTPException(400, 'New password is required when changing the Pi-hole host')
 
-    # All valid — persist
+    # All valid — persist in one transaction, so a failure (e.g. encryption)
+    # cannot leave the old password wiped while the new host is stored.
     current_host = get_config(enricher_db, 'pihole_host', '')
+    updates = {}
 
     if 'enabled' in body:
-        set_config(enricher_db, 'pihole_enabled', body['enabled'])
+        updates['pihole_enabled'] = body['enabled']
         if not body['enabled']:
-            set_config(enricher_db, 'pihole_poll_status', None)
+            updates['pihole_poll_status'] = None
     if 'host' in body:
         if changed:
-            set_config(enricher_db, 'pihole_password', '')
-        set_config(enricher_db, 'pihole_host', normalized_host)
-    if 'password' in body:
-        val = body['password']
-        if val:
-            password_host = normalized_host or current_host
-            set_config(enricher_db, 'pihole_password_host', password_host)
-            set_config(enricher_db, 'pihole_password', encrypt_api_key(val))
+            updates['pihole_password'] = ''
+        updates['pihole_host'] = normalized_host
+    if body.get('password'):
+        password_host = normalized_host or current_host
+        if not password_host:
+            raise HTTPException(400, 'A Pi-hole host is required to save a password')
+        updates['pihole_password_host'] = password_host
+        updates['pihole_password'] = encrypt_api_key(body['password'])
     if interval is not None:
-        set_config(enricher_db, 'pihole_poll_interval', interval)
+        updates['pihole_poll_interval'] = interval
     if 'enrichment' in body:
-        set_config(enricher_db, 'pihole_enrichment', body['enrichment'])
+        updates['pihole_enrichment'] = body['enrichment']
 
     # Reset cursor when host changes so we re-fetch from the new instance
-    new_host = normalized_host
-    if new_host is not None and new_host != current_host:
-        set_config(enricher_db, 'pihole_last_cursor', 0)
+    if normalized_host is not None and normalized_host != current_host:
+        updates['pihole_last_cursor'] = 0
+    enricher_db.set_config_many(updates)
 
     return {"success": True}
 
