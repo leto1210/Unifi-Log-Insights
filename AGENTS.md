@@ -26,7 +26,7 @@ Each external integration (UniFi, Pi-hole, AdGuard Home, AbuseIPDB) has an `<int
 
 - **Pollers / background tasks** gate their loop on the flag and re-read it on `reload_config()` (SIGUSR2).
 - **On-demand outbound routes** return `409 {"detail": "integration disabled"}` when the flag is off (distinct from `400` when the integration was never configured).
-- **Widgets, stats, and any read path** that surfaces integration-sourced data must gate on the same flag rather than querying the underlying table blindly. A widget that reads the data directly (as the old `_query_top_dns` did against `logs.log_type='dns'` while ignoring `adguard_enabled`/`pihole_enabled`) is a bug: it keeps showing data from an integration the user has turned off.
+- **Widgets, stats, and any read path** that surfaces integration-sourced data must gate on the same flag rather than querying the underlying table blindly. A widget that reads the data directly (for example querying `logs.log_type='dns'` without checking `adguard_enabled`/`pihole_enabled`) is a bug: it keeps showing data from an integration the user has turned off.
 
 When adding a new integration or a new surface for an existing one, wire it to the flag on both the write path (poller/outbound calls) and the read path (widgets/stats), and add regression coverage for the disabled state. The user-facing behaviour is documented under "Enabling / disabling integrations" in the Configuration wiki.
 
