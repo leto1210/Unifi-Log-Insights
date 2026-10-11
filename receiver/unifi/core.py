@@ -83,6 +83,7 @@ class UniFiAPI:
         self._last_poll_error = None
         self._client_count = 0
         self._device_count = 0
+        self._idless_policies_warned = None  # last id-less policy set warned about (upstream #112)
         try:
             self._resolve_config()
         except Exception as e:
@@ -907,8 +908,14 @@ class UniFiAPI:
         return all_policies
 
     def get_firewall_data(self) -> dict:
-        """Fetch policies + zones in one call for the frontend."""
-        policies = self.get_firewall_policies()
+        """Fetch policies + zones in one call for the frontend.
+
+        All policies are returned, including any without an ``id`` (upstream
+        issue #112): they still shape the zone matrix and resolve rule actions, but
+        cannot be patched, so the UI disables their toggle and the routes
+        reject non-UUID ids. Counts include them.
+        """
+        policies = self._warn_idless_policies(self.get_firewall_policies())
         zones = self.get_firewall_zones()
 
         logging_enabled = sum(1 for p in policies if p.get('loggingEnabled'))
@@ -921,6 +928,22 @@ class UniFiAPI:
             'loggingEnabled': logging_enabled,
             'loggingDisabled': logging_disabled,
         }
+
+    def _warn_idless_policies(self, policies: list) -> list:
+        """Warn once per distinct set of id-less policies; return the list unchanged."""
+        idless = [p for p in policies if not p.get('id')]
+        if not idless:
+            self._idless_policies_warned = None
+            return policies
+        names = tuple(sorted(str(p.get('name')) for p in idless))
+        if names != self._idless_policies_warned:
+            self._idless_policies_warned = names
+            logger.warning(
+                "Integration API returned %d firewall policies without an id; their logging cannot be "
+                "toggled from Insights Plus (first names: %s). Likely legacy rules the zone-based "
+                "firewall migration did not fully convert, see jmasarweh/UniFi-Insights-Plus#112.",
+                len(idless), list(names[:5]))
+        return policies
 
     def patch_firewall_policy(self, policy_id: str, logging_enabled: bool) -> dict:
         """Update loggingEnabled on a single policy."""
@@ -970,7 +993,8 @@ class UniFiAPI:
         failed = 0
         skipped = 0
         retried = 0
-        errors = []
+        errors = []               # per-policy patch failures, capped at 20 in the result
+        verification_errors = []  # at most one entry, always kept after the cap
 
         # Filter out items with no loggingEnabled value OR no id. Without the
         # id filter, a single malformed row would raise KeyError inside the
@@ -1027,7 +1051,8 @@ class UniFiAPI:
                     logger.debug("progress_callback failed during verification", exc_info=True)
             try:
                 actual_policies = self.get_firewall_policies()
-                actual_map = {p['id']: p.get('loggingEnabled', False) for p in actual_policies}
+                actual_map = {p['id']: p.get('loggingEnabled', False)
+                              for p in actual_policies if p.get('id')}
                 for item in work_items:
                     pid = item['id']
                     if pid in successful_ids and actual_map.get(pid) != item['loggingEnabled']:
@@ -1037,13 +1062,13 @@ class UniFiAPI:
                                    len(mismatched), success)
                     failed += len(mismatched)
                     success = max(0, success - len(mismatched))
-                    errors.append({
+                    verification_errors.append({
                         'verification': f'{len(mismatched)} policies did not reflect the requested state',
                         'ids': mismatched[:20],
                     })
             except Exception as e:
                 logger.warning("Bulk patch: verification failed: %s", e)
-                errors.append({'verification': f'Could not verify: {e}'})
+                verification_errors.append({'verification': f'Could not verify: {e}'})
 
         logger.info("Bulk patch complete: %d total, %d success, %d failed, %d skipped, %d retried, %d mismatched",
                      total, success, failed, skipped, retried, len(mismatched))
@@ -1054,7 +1079,7 @@ class UniFiAPI:
             'failed': failed,
             'skipped': skipped,
             'retried': retried,
-            'errors': errors[:20],
+            'errors': errors[:20] + verification_errors,
         }
 
     # ── Phase 2: Client/Device Polling ───────────────────────────────────────
