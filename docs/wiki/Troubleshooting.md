@@ -14,18 +14,19 @@ Schema migration failed
 
 The runtime `ALTER DATABASE … SET log_autovacuum_min_duration` migration needs superuser privilege to succeed on the target DB and can also fail when the current session doesn't allow it. Fixed in v3.8.0-beta.2+ — the migration is now best-effort (warns and continues). If you're on beta.1 or you built from a commit older than 4c7e45f, upgrade.
 
-## Bulk syslog toggle fails with "Bulk update failed. One or more policies could not be processed."
+## Firewall policies without an id
 
-Log signature:
+Some UniFi controllers return firewall policies from the Integration API without an `id` field — usually legacy rules that the zone-based firewall migration did not fully convert. Their logging cannot be toggled from Insights Plus because there is nothing to PATCH.
 
-```
-KeyError: 'id'
-    at unifi_api.py:… in bulk_patch_logging
-```
+What you see:
 
-Some UDM firewall policies come from the Integration API without an `id` field — they can't be PATCHed. Fixed in v3.8.0-beta.3+ (PR #32): the UI no longer offers a toggle for those policies, and the backend skips them gracefully. Upgrade to the current image.
+- **Firewall Rules** shows a yellow notice with the number of such policies. They stay in the zone matrix (the gateway still enforces them), but their syslog toggle is disabled.
+- **Log detail → Rule Logging** shows "Legacy rule …" when the only matching policy has no id.
+- Container logs, once per distinct set: `Integration API returned N firewall policies without an id`.
 
-If you still see it after upgrading: `docker logs unifi-log-insight | grep "skipping item with no id"` — the log line dumps the raw policy so we can characterise a new case. Open an issue with the output.
+Fix: toggle syslog for that rule in the UniFi Network app, or recreate the rule there so the controller assigns it an id. The API rejects any non-UUID policy id with `400 Invalid firewall policy id`; in a bulk update those items are counted as failed and the rest still apply.
+
+Older images (before v3.8.0-beta.3) crashed the bulk toggle with `KeyError: 'id'` in `bulk_patch_logging`; upgrade if you see that.
 
 ## Ingestion runs but the health check reports 0 logs
 

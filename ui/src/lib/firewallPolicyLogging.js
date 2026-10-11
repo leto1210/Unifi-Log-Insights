@@ -5,19 +5,28 @@
  * to avoid duplicating controllability checks and confirmation copy.
  */
 
-/** Whether a policy can have its logging toggled. */
-export function isControllablePolicy(policy) {
+/** Whether a policy shapes zone-pair posture: enabled and not a DERIVED auto-rule.
+ *  Id-less policies count here: they are real rules the gateway enforces. */
+export function isPostureCandidate(policy) {
   if (!policy) return false
   if (policy.metadata?.origin === 'DERIVED') return false
   if (policy.enabled === false) return false
-  // Some UDM policies (observed: certain USER_DEFINED "Allow X to All"
-  // grouped rules) come back from the Integration API with no `id` field
-  // at all. They can't be PATCHed — the API surface treats them as
-  // read-only. Filter them out so the UI doesn't show a toggle we know
-  // can't succeed.
-  if (!policy.id) return false
   return true
 }
+
+/** Whether a policy can have its logging toggled. Some UDM policies (observed:
+ *  certain USER_DEFINED "Allow X to All" grouped rules) come back from the
+ *  Integration API with no `id`; a PATCH would target "undefined". */
+export function isControllablePolicy(policy) {
+  return isPostureCandidate(policy) && !!policy.id
+}
+
+/** Troubleshooting page for policies the controller returns without an id.
+ *  Linked from the FirewallRules notice and the LogDetail Rule Logging message. */
+export const IDLESS_DOCS_URL = 'https://github.com/leto1210/Unifi-Log-Insights/wiki/Troubleshooting#firewall-policies-without-an-id'
+
+/** Phrase in the backend's id-less match message that LogDetail renders as the docs link. */
+export const IDLESS_DOCS_LINK_TEXT = 'Troubleshooting on the docs site'
 
 /** Warning text shared by both FirewallRules bulk confirm and LogDetail single confirm. */
 export const SYSLOG_DELAY_WARNING =
