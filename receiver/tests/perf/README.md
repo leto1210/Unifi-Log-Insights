@@ -51,21 +51,12 @@ noticed. Use a host-side loop instead.
 The scripts on the host live in `/tmp/vacuum_perf/`; a wrapper
 `/tmp/vacuum_perf/loop.sh` re-`docker cp`s the collector into the container
 when the container is missing it (its `/tmp` is ephemeral) and calls
-`--once` every 5 min. Contents of `loop.sh`:
-
-```bash
-#!/bin/bash
-while true; do
-  /usr/local/bin/docker exec unifi-log-insight test -f /tmp/vacuum_metrics.py \
-    || /usr/local/bin/docker cp /tmp/vacuum_perf/vacuum_metrics.py unifi-log-insight:/tmp/vacuum_metrics.py
-  /usr/local/bin/docker exec unifi-log-insight \
-    python /tmp/vacuum_metrics.py --once --notes baseline \
-    >> /tmp/vacuum_perf/collector.log 2>&1
-  sleep 300
-done
-```
-
-Launch:
+`--once` every 5 min. The script is versioned as [`loop.sh`](loop.sh):
+every `docker` call is wrapped in `timeout` (a `docker exec` straddling a
+container restart used to hang the loop silently), and the receiver's logs
+are piped in via `docker logs | docker exec -i … --flush-log-cmd cat` so
+flush latency (Q5) is populated. Push `loop.sh` and `vacuum_metrics.py` to
+`/tmp/vacuum_perf/` with `scp -O`, then launch:
 
 ```bash
 ssh tperigault@core-syno 'setsid nohup bash /tmp/vacuum_perf/loop.sh \
@@ -109,9 +100,23 @@ workarounds.
   `Slow DB flush: N logs took X.XXs` at WARN. Without `LOG_LEVEL=DEBUG` you
   only see the slow ones — P95/P99 will still be meaningful (they'll converge
   to the slow tail), but P50 will be missing on healthy periods.
-* `--flush-log-cmd 'tail -n 5000 /proc/1/fd/1'` targets supervisord, not the
-  receiver directly. For fidelity, point at the supervisord log file for the
-  receiver process instead (path varies by image build).
+* The receiver logs to container stdout (supervisord `/dev/stdout`), so there
+  is no log file to tail inside the container and `docker` isn't available
+  there either. `loop.sh` pipes `docker logs --since 6m` into the collector's
+  stdin and uses `--flush-log-cmd cat`. Run by hand the same way.
+* Without a snapshot having flush data, Q5 returns 0 rows (the case until
+  2026-10-03).
+
+### I/O timings (`track_io_timing`)
+
+`vac_read_ms` / `vac_write_ms` (Q6) stay 0 unless the server has
+`track_io_timing = on`. It's a one-off change on duncan (reload, no restart),
+negligible overhead on PG16+:
+
+```sql
+ALTER SYSTEM SET track_io_timing = on;
+SELECT pg_reload_conf();
+```
 * If you want full-fidelity flush stats, `LOG_LEVEL=DEBUG` for 24 h is fine
   — it's one INFO-sized line per batch every ~1 s.
 
