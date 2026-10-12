@@ -71,6 +71,14 @@ def set_config(db, key: str, value):
     return db.set_config(key, value)
 
 
+def ordered_wan_ips(ip_by_iface: dict, wan_interfaces) -> list[str]:
+    """WAN IPs from an {interface: ip} map, in wan_interfaces order.
+
+    Interfaces missing from the map and empty IP values are dropped.
+    """
+    return [ip_by_iface[iface] for iface in wan_interfaces if ip_by_iface.get(iface)]
+
+
 def get_wan_ips_from_config(db) -> list[str]:
     """Derive ordered WAN IP list from wan_ip_by_iface + wan_interfaces.
 
@@ -80,10 +88,7 @@ def get_wan_ips_from_config(db) -> list[str]:
     """
     wan_ip_by_iface = db.get_config('wan_ip_by_iface')
     if wan_ip_by_iface:
-        wan_interfaces = db.get_config('wan_interfaces', [])
-        # Derive ordered list following wan_interfaces order
-        return [wan_ip_by_iface[iface] for iface in wan_interfaces
-                if iface in wan_ip_by_iface and wan_ip_by_iface[iface]]
+        return ordered_wan_ips(wan_ip_by_iface, db.get_config('wan_interfaces', []))
     # Legacy fallback: use wan_ips config key directly
     return db.get_config('wan_ips') or []
 

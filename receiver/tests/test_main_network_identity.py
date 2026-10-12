@@ -79,6 +79,38 @@ class TestRefreshNetworkIdentityFromLogs:
         db.detect_gateway_ips.assert_called_once()
 
 
+class TestIdentityReloadAfterRefresh:
+    """A changed persisted identity is reloaded into the running parsers."""
+
+    def _run(self, db):
+        mod = sys.modules['service.network_identity']
+        with patch.object(mod, 'parsers') as fake_parsers:
+            _refresh_network_identity_from_logs(db)
+        return fake_parsers.reload_config_from_db
+
+    def setup_method(self):
+        sys.modules['service.network_identity']._loaded_identity = None
+
+    def test_reloads_once_per_identity_change(self):
+        config = {'unifi_enabled': False, 'wan_ip': '1.1.1.1'}
+        db = MagicMock()
+        db.get_config.side_effect = lambda key, default=None: config.get(key, default)
+
+        assert self._run(db).call_count == 1   # first refresh loads
+        assert self._run(db).call_count == 0   # unchanged: no reload
+        config['wan_ip'] = '2.2.2.2'
+        assert self._run(db).call_count == 1   # changed: reload
+
+    def test_failed_reload_retries_next_run(self):
+        db = MagicMock()
+        db.get_config.side_effect = lambda key, default=None: False if key == 'unifi_enabled' else None
+        mod = sys.modules['service.network_identity']
+        with patch.object(mod, 'parsers') as fake_parsers:
+            fake_parsers.reload_config_from_db.side_effect = Exception("db down")
+            _refresh_network_identity_from_logs(db)  # must not raise
+        assert self._run(db).call_count == 1
+
+
 class TestPeriodicStatsLogging:
 
     def test_skips_db_queries_when_not_debug(self):

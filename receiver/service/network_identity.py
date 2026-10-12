@@ -4,6 +4,7 @@ import logging
 
 import psycopg2
 
+import parsers
 from db import Database
 from enrichment import Enricher
 
@@ -15,9 +16,27 @@ def _use_log_identity_detection(db: Database) -> bool:
     return not bool(db.get_config('unifi_enabled', False))
 
 
+# Identity keys the parsers load; _loaded_identity holds the values they last
+# loaded after a refresh (None until the first one). Only the refresh below
+# touches it, and only after a successful reload, so failures retry next run.
+_IDENTITY_KEYS = ('wan_ip_by_iface', 'wan_ips', 'wan_ip', 'gateway_ips')
+_loaded_identity = None
+
+
 def _refresh_network_identity_from_logs(db: Database):
-    """Run log-based WAN/gateway detection only when UniFi is not authoritative."""
-    if not _use_log_identity_detection(db):
+    """Run log-based WAN/gateway detection only when UniFi is not authoritative.
+
+    When the persisted identity differs from what the parsers last loaded,
+    they reload it so a newly learned WAN IP takes effect without a restart.
+    Never raises: schedule.run_pending() does not catch job exceptions, so
+    one would end the scheduler thread.
+    """
+    global _loaded_identity
+    try:
+        if not _use_log_identity_detection(db):
+            return
+    except Exception as e:
+        logger.error("Network identity refresh skipped (UniFi gate check failed): %s", e)
         return
     try:
         db.detect_wan_ip()
@@ -27,6 +46,13 @@ def _refresh_network_identity_from_logs(db: Database):
         db.detect_gateway_ips()
     except Exception as e:
         logger.error("Gateway IP detection failed: %s", e)
+    try:
+        persisted = tuple(db.get_config(key) for key in _IDENTITY_KEYS)
+        if persisted != _loaded_identity:
+            parsers.reload_config_from_db(db)
+            _loaded_identity = persisted
+    except Exception as e:
+        logger.error("Reloading detected network identity failed, will retry: %s", e)
 
 
 def _log_periodic_stats(db: Database, enricher: Enricher):
