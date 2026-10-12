@@ -93,13 +93,14 @@ def main():
     # Check for existing user migration
     setup_complete = get_config(db, "setup_complete", None)
     if setup_complete is None:
-        # Count firewall logs to detect existing installation
+        # Any firewall log means an existing installation (EXISTS stops at
+        # the first row; COUNT(*) read every firewall row)
         with db.get_conn() as conn:
             with conn.cursor() as cur:
-                cur.execute("SELECT COUNT(*) FROM logs WHERE log_type = 'firewall'")
-                log_count = cur.fetchone()[0]
+                cur.execute("SELECT EXISTS (SELECT 1 FROM logs WHERE log_type = 'firewall')")
+                has_firewall_logs = cur.fetchone()[0]
 
-        if log_count > 0:
+        if has_firewall_logs:
             # Auto-migrate existing installation with safe defaults
             logger.info("Migrating existing installation to dynamic config...")
             set_config(db, "wan_interfaces", ["ppp0"])

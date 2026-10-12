@@ -28,7 +28,7 @@ from psycopg2 import pool, extras
 from psycopg2.extras import Json
 
 from .connection import build_conn_params
-from .config import get_wan_ips_from_config
+from .config import get_wan_ips_from_config, ordered_wan_ips
 from .exceptions import AdGuardHostMismatch
 from .logs_sql import INSERT_COLUMNS, INSERT_SQL
 from .retention import (
@@ -59,6 +59,29 @@ class _PackageLoggerProxy:
 
 logger = _PackageLoggerProxy()
 
+
+
+def _recent_firewall_cutoff(cur):
+    """Lower time bound for log-based WAN/gateway detection (upstream #103).
+
+    Returns 7 days before the newest firewall row, or None when there are no
+    firewall rows (HAVING drops the single aggregate row). Anchored on the
+    newest row rather than wall-clock time so a gateway that stopped sending
+    still has a window; LEAST(..., NOW()) keeps one future-dated row (gateway
+    clock skew) from pushing the window into the future.
+
+    MAX() is an index-only edge lookup on idx_logs_type_time. Callers bind the
+    result as a parameter (`timestamp >= %s`) so the planner range-scans the
+    index instead of reading every firewall row.
+    """
+    cur.execute("""
+        SELECT LEAST(MAX(timestamp), NOW()) - INTERVAL '7 days'
+        FROM logs
+        WHERE log_type = 'firewall'
+        HAVING MAX(timestamp) IS NOT NULL
+    """)
+    row = cur.fetchone()
+    return row[0] if row else None
 
 class Database:
     """PostgreSQL connection pool and operations."""
@@ -2040,33 +2063,42 @@ class Database:
     def get_wan_ips_by_interface(self, interfaces: list) -> dict:
         """Detect WAN IP for each interface using the most common public dst_ip.
 
+        Only firewall rows since _recent_firewall_cutoff() are considered.
         Returns dict of {interface: wan_ip_str} for each interface that has one.
         """
         if not interfaces:
             return {}
         with self.get_conn() as conn:
             with conn.cursor() as cur:
+                cutoff = _recent_firewall_cutoff(cur)
+                if cutoff is None:
+                    return {}
                 placeholders = ','.join(['%s'] * len(interfaces))
                 cur.execute(f"""
                     SELECT interface_in AS iface,
                            MODE() WITHIN GROUP (ORDER BY host(dst_ip)) AS wan_ip
                     FROM logs
                     WHERE log_type = 'firewall'
+                      AND timestamp >= %s
                       AND interface_in IN ({placeholders})
                       AND dst_ip IS NOT NULL
                       AND {self._PRIVATE_IP_FILTER}
                     GROUP BY interface_in
-                """, interfaces)
+                """, [cutoff, *interfaces])
                 return {row[0]: row[1] for row in cur.fetchall() if row[1]}
 
     def detect_wan_ip(self) -> str | None:
-        """Detect WAN IPs from logs and persist to system_config.
+        """Detect WAN IPs from logs and merge them into system_config.
 
         Only called when unifi_enabled is false (gated by caller).
-        Computes per-interface WAN IPs from logs via
-        get_wan_ips_by_interface() and stores wan_ip_by_iface automatically.
+        Observed per-interface IPs (get_wan_ips_by_interface()) are merged
+        into the persisted wan_ip_by_iface: entries for interfaces no longer
+        in wan_interfaces are pruned, observed interfaces take the observed
+        IP, and interfaces quiet in the detection window keep their persisted
+        IP. An empty map, wan_ips or wan_ip is never written, so a quiet
+        window never erases identity.
 
-        Returns the primary detected WAN IP or None.
+        Returns the primary WAN IP (first in wan_interfaces order) or None.
 
         .. deprecated:: Phase 1 transition
             Retained for phase-1 transition only (non-UniFi installs).
@@ -2076,19 +2108,18 @@ class Database:
         if not wan_interfaces:
             return None
 
-        # Compute per-interface WAN IPs from logs
-        iface_ips = self.get_wan_ips_by_interface(wan_interfaces)
+        current_map = self.get_config('wan_ip_by_iface') or {}
+        merged = {k: v for k, v in current_map.items() if k in wan_interfaces}
+        merged.update(self.get_wan_ips_by_interface(wan_interfaces))
+        if not merged:
+            # Nothing observed and nothing left after pruning: keep what is
+            # persisted (an empty map would fall back to legacy wan_ips).
+            return None
+        if merged != current_map:
+            self.set_config('wan_ip_by_iface', merged)
+            logger.info("wan_ip_by_iface merged from logs: %s", merged)
 
-        # Store wan_ip_by_iface (auto-populate for legacy installs)
-        if iface_ips:
-            current_map = self.get_config('wan_ip_by_iface')
-            if current_map != iface_ips:
-                self.set_config('wan_ip_by_iface', iface_ips)
-                logger.info("wan_ip_by_iface auto-populated from logs: %s", iface_ips)
-
-        # Derive ordered wan_ips following wan_interfaces order
-        wan_ips = [iface_ips[iface] for iface in wan_interfaces
-                   if iface in iface_ips and iface_ips[iface]]
+        wan_ips = ordered_wan_ips(merged, wan_interfaces)
         primary = wan_ips[0] if wan_ips else None
 
         # Persist primary wan_ip
@@ -2100,7 +2131,7 @@ class Database:
 
         # Persist wan_ips list
         current_list = self.get_config('wan_ips') or []
-        if sorted(wan_ips) != sorted(current_list):
+        if wan_ips and sorted(wan_ips) != sorted(current_list):
             self.set_config('wan_ips', wan_ips)
             if len(wan_ips) > 1:
                 logger.info("WAN IPs detected (multi-WAN): %s", wan_ips)
@@ -2116,34 +2147,45 @@ class Database:
 
         UniFi zone-based rules ending in '_LOCAL' target traffic destined for
         the gateway itself. The dst_ip on those rules (excluding broadcast/
-        multicast) gives us the gateway's internal IP per VLAN.
-        Stores result as 'gateway_ips' list in system_config.
+        multicast) gives us the gateway's internal IP per VLAN. Only firewall
+        rows since _recent_firewall_cutoff() are considered.
+
+        Observed IPs are merged into the persisted 'gateway_ips' list (sorted
+        union). Addresses are never removed automatically, so a VLAN quiet in
+        the window keeps its gateway IP. Returns the merged list.
         """
         with self.get_conn() as conn:
             with conn.cursor() as cur:
-                cur.execute("""
+                cutoff = _recent_firewall_cutoff(cur)
+                if cutoff is None:
+                    detected = []
+                else:
+                    cur.execute("""
                     SELECT DISTINCT host(dst_ip) AS gateway_ip
                     FROM logs
                     WHERE log_type = 'firewall'
+                      AND timestamp >= %s
                       AND rule_name LIKE '%%\\_LOCAL%%'
                       AND (dst_ip << '10.0.0.0/8' OR dst_ip << '172.16.0.0/12'
                            OR dst_ip << '192.168.0.0/16'
                            OR dst_ip << 'fc00::/7')
                       AND host(dst_ip) NOT IN ('224.0.0.251', '255.255.255.255')
-                """)
-                detected = [row[0] for row in cur.fetchall()]
+                    """, [cutoff])
+                    detected = [row[0] for row in cur.fetchall()]
 
-        current = self.get_config('gateway_ips', [])
-        if sorted(detected) != sorted(current):
-            self.set_config('gateway_ips', detected)
-            logger.info("Gateway IPs detected: %s", detected)
+        current = self.get_config('gateway_ips', []) or []
+        merged = sorted(set(current) | set(detected))
+        if merged != sorted(current):
+            self.set_config('gateway_ips', merged)
+            logger.info("Gateway IPs merged from logs: %s", merged)
 
-        return detected
+        return merged
 
     def get_wan_ip_candidates(self) -> list[dict]:
         """Return non-bridge, non-VPN firewall interfaces with their WAN IPs.
 
-        Used by the setup wizard to discover candidate WAN interfaces.
+        Used by the setup wizard to discover candidate WAN interfaces. Only
+        firewall rows since _recent_firewall_cutoff() are considered.
 
         .. deprecated:: Phase 1 transition
             Retained for phase-1 transition only (log-detection wizard).
@@ -2155,6 +2197,9 @@ class Database:
         )
         with self.get_conn() as conn:
             with conn.cursor() as cur:
+                cutoff = _recent_firewall_cutoff(cur)
+                if cutoff is None:
+                    return []
                 cur.execute(f"""
                     SELECT
                         interface_in AS interface,
@@ -2164,12 +2209,13 @@ class Database:
                         ) AS wan_ip
                     FROM logs
                     WHERE log_type = 'firewall'
+                      AND timestamp >= %s
                       AND interface_in IS NOT NULL
                       AND interface_in NOT LIKE 'br%%'
                       {vpn_excludes}
                     GROUP BY interface_in
                     ORDER BY event_count DESC
-                """)
+                """, [cutoff])
                 return [
                     {'interface': r[0], 'event_count': int(r[1]), 'wan_ip': r[2] or ''}
                     for r in cur.fetchall()

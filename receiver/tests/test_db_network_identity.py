@@ -165,3 +165,78 @@ class TestPersistNetworkIdentity:
         keys_written = [c[0][0] for c in mock_db.set_config.call_args_list]
         assert 'wan_ip_by_iface' in keys_written
         assert 'gateway_ip_vlans' in keys_written
+
+
+# ── Log-based detection (windowed, merge-only) ──────────────────────────────
+
+def _config_db(config, observed=None):
+    """MagicMock Database whose get_config/set_config read and write ``config``."""
+    db = MagicMock()
+    db.get_config.side_effect = lambda key, default=None: config.get(key, default)
+    db.set_config.side_effect = lambda key, value: config.__setitem__(key, value)
+    db.get_wan_ips_by_interface.return_value = observed or {}
+    return db
+
+
+class TestDetectWanIpMerge:
+    """Database.detect_wan_ip() merges observations into persisted identity."""
+
+    def test_quiet_interface_keeps_persisted_ip(self):
+        config = {'wan_interfaces': ['eth8', 'eth9'],
+                  'wan_ip_by_iface': {'eth8': '1.1.1.1', 'eth9': '2.2.2.2'},
+                  'wan_ips': ['1.1.1.1', '2.2.2.2'], 'wan_ip': '1.1.1.1'}
+        db = _config_db(config, observed={'eth8': '3.3.3.3'})
+        assert Database.detect_wan_ip(db) == '3.3.3.3'
+        assert config['wan_ip_by_iface'] == {'eth8': '3.3.3.3', 'eth9': '2.2.2.2'}
+        assert config['wan_ips'] == ['3.3.3.3', '2.2.2.2']
+
+    def test_nothing_observed_never_clears_identity(self):
+        config = {'wan_interfaces': ['ppp0'], 'wan_ips': ['1.1.1.1'], 'wan_ip': '1.1.1.1'}
+        db = _config_db(config)
+        assert Database.detect_wan_ip(db) is None
+        db.set_config.assert_not_called()
+
+    def test_prunes_unconfigured_interface(self):
+        config = {'wan_interfaces': ['eth8'],
+                  'wan_ip_by_iface': {'eth8': '1.1.1.1', 'eth9': '2.2.2.2'},
+                  'wan_ips': ['1.1.1.1', '2.2.2.2'], 'wan_ip': '1.1.1.1'}
+        db = _config_db(config)
+        Database.detect_wan_ip(db)
+        assert config['wan_ip_by_iface'] == {'eth8': '1.1.1.1'}
+        assert config['wan_ips'] == ['1.1.1.1']
+
+
+class TestDetectGatewayIpsMerge:
+    """Database.detect_gateway_ips() unions observations, bounded by the cutoff."""
+
+    def _db(self, config, cutoff_row, detected_rows):
+        db = _config_db(config)
+        cur = db.get_conn.return_value.__enter__.return_value.cursor.return_value.__enter__.return_value
+        cur.fetchone.return_value = cutoff_row
+        cur.fetchall.return_value = detected_rows
+        return db, cur
+
+    def test_union_keeps_quiet_vlan_gateway(self):
+        config = {'gateway_ips': ['10.0.0.1']}
+        db, cur = self._db(config, ('cutoff',), [('10.0.20.1',)])
+        assert Database.detect_gateway_ips(db) == ['10.0.0.1', '10.0.20.1']
+        assert config['gateway_ips'] == ['10.0.0.1', '10.0.20.1']
+        # The detection query is bounded by the bound cutoff parameter
+        sql, params = cur.execute.call_args_list[-1].args
+        assert 'timestamp >= %s' in sql and params == ['cutoff']
+
+    def test_no_firewall_rows_keeps_persisted(self):
+        config = {'gateway_ips': ['10.0.0.1']}
+        db, cur = self._db(config, None, [])
+        assert Database.detect_gateway_ips(db) == ['10.0.0.1']
+        assert cur.execute.call_count == 1  # only the cutoff probe
+        db.set_config.assert_not_called()
+
+
+def test_cutoff_probe_returns_none_on_empty_table():
+    """HAVING drops the aggregate row when there are no firewall rows."""
+    from db.core import _recent_firewall_cutoff
+    cur = MagicMock()
+    cur.fetchone.return_value = None
+    assert _recent_firewall_cutoff(cur) is None
+    assert 'HAVING MAX(timestamp) IS NOT NULL' in cur.execute.call_args.args[0]
