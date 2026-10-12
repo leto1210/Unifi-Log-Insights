@@ -75,7 +75,12 @@ def _scheduler_tick(db: Database):
     """
     if _retention_reload_requested.is_set():
         _retention_reload_requested.clear()
-        _register_retention_job(db)
+        try:
+            _register_retention_job(db)
+        except Exception as e:
+            # An exception here would end the scheduler thread; retry next tick.
+            logger.error("Retention job rebuild failed, retrying next tick: %s", e)
+            _retention_reload_requested.set()
     schedule.run_pending()
 
 

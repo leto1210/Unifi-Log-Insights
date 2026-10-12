@@ -135,6 +135,24 @@ def test_scheduler_tick_is_noop_when_event_unset(main_module):
     assert resolver.call_count == 1, 'resolver must not be called when Event is clear'
 
 
+
+def test_scheduler_tick_survives_rebuild_failure(main_module):
+    """A DB error while rebuilding the retention job must not escape the tick
+    (that would end the scheduler thread) and must re-arm the Event so the
+    rebuild is retried on the next tick.
+    """
+    db = MagicMock()
+    main_module.Database.resolve_retention_time = MagicMock(
+        side_effect=[RuntimeError('db down'), _time_cfg('06:30', 'ui')])
+
+    main_module._retention_reload_requested.set()
+    main_module._scheduler_tick(db)  # must not raise
+    assert main_module._retention_reload_requested.is_set()
+
+    main_module._scheduler_tick(db)
+    assert list(schedule.get_jobs('retention'))[0].at_time.hour == 6
+    assert not main_module._retention_reload_requested.is_set()
+
 # ── rdns_cache retention sweep (issue #98) ──────────────────────────────────
 
 def test_retention_cleanup_invokes_cleanup_rdns_cache(main_module):

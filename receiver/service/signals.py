@@ -38,12 +38,21 @@ def make_reload_config_handler(db, receiver, unifi_api, pihole, enricher, adguar
     """Return a SIGUSR2 handler that reloads config from the database."""
     def reload_config(signum, frame):
         logger.info("Received SIGUSR2, reloading config from database...")
-        parsers.reload_config_from_db(db)
-        unifi_api.reload_config()
-        pihole.reload_config()
-        enricher.reload_config()
-        adguard_poller.reload_config()
-        receiver._load_disabled_types()
+        # Each step runs on its own: a transient DB error in one must not leave
+        # the others (or the retention rebuild below) stale.
+        steps = (
+            ('parsers', lambda: parsers.reload_config_from_db(db)),
+            ('unifi_api', unifi_api.reload_config),
+            ('pihole', pihole.reload_config),
+            ('enricher', enricher.reload_config),
+            ('adguard_poller', adguard_poller.reload_config),
+            ('disabled log types', receiver._load_disabled_types),
+        )
+        for name, step in steps:
+            try:
+                step()
+            except Exception as e:
+                logger.error("Config reload step '%s' failed: %s", name, e)
         # scheduler thread will rebuild the retention job on its next tick
         _retention_reload_requested.set()
 
