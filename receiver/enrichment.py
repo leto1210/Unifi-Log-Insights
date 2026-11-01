@@ -888,7 +888,7 @@ class Enricher:
         self._known_wan_ip = None
         self._excluded_ips = set()  # WAN IPs, gateway IPs — not enrichable
         self._pihole_enrichment = 'both'  # none|geoip|threat|both
-        # @coderabbit Accessed only from the single-threaded UDP receive/enrich
+        # Accessed only from the single-threaded UDP receive/enrich
         # loop today, so this coalescing map intentionally does not use a lock.
         # If enrich() is ever called concurrently, revisit Enricher shared-state
         # locking.
