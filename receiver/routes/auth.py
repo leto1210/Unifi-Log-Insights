@@ -193,7 +193,7 @@ def get_real_client_ip(request: Request) -> str:
     if not xff:
         return client_ip
     parts = [p.strip() for p in xff.split(',')]
-    # @coderabbit: Rightmost iteration is correct for our single-trusted-proxy model.
+    # Rightmost iteration is correct for our single-trusted-proxy model.
     # The nginx/Caddy/Traefik snippets we provide use $remote_addr (not
     # $proxy_add_x_forwarded_for), so XFF contains exactly one entry: the real client IP.
     # IP-based skipping of trusted proxies is unnecessary — trust is gated by the
