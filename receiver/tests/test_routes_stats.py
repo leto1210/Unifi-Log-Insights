@@ -286,3 +286,17 @@ class TestStatsTables:
         assert resp.status_code == 500
         body = resp.json()
         assert 'detail' in body
+
+
+def test_query_by_type_sorts_desc_and_drops_zero_counts():
+    """_query_by_type orders by count desc and omits types with no rows in range."""
+    from routes.stats import _query_by_type
+
+    cur = MagicMock()
+    cur.fetchall.return_value = [
+        {'log_type': 'dhcp', 'count': 5},
+        {'log_type': 'wifi', 'count': 0},
+        {'log_type': 'firewall', 'count': 90},
+    ]
+    result = _query_by_type(cur, datetime.now(timezone.utc))
+    assert list(result.items()) == [('firewall', 90), ('dhcp', 5)]

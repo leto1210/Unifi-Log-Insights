@@ -112,6 +112,31 @@ def _query_top_blocked_internal_ips(cur, cutoff):
     return [dict(r) for r in cur.fetchall()]
 
 
+def _query_by_type(cur, cutoff):
+    """Log counts per log_type since cutoff, as {log_type: count} ordered by count desc.
+
+    A plain ``GROUP BY log_type`` makes the planner scan the whole
+    ``idx_logs_type_time (log_type, timestamp)`` index (timestamp is not the
+    leading column), which exceeds statement_timeout on large tables for 24h+
+    ranges. Emulate a loose index scan instead: enumerate the few distinct
+    log_types, then range-count each one on (log_type, timestamp).
+    """
+    cur.execute(
+        "WITH RECURSIVE t AS ("
+        "  (SELECT log_type FROM logs ORDER BY log_type LIMIT 1) "
+        "  UNION ALL "
+        "  SELECT (SELECT log_type FROM logs WHERE log_type > t.log_type "
+        "          ORDER BY log_type LIMIT 1) FROM t WHERE t.log_type IS NOT NULL"
+        ") "
+        "SELECT t.log_type, (SELECT COUNT(*) FROM logs l "
+        "  WHERE l.log_type = t.log_type AND l.timestamp >= %s) AS count "
+        "FROM t WHERE t.log_type IS NOT NULL",
+        [cutoff]
+    )
+    rows = sorted(cur.fetchall(), key=lambda r: r['count'], reverse=True)
+    return {r['log_type']: r['count'] for r in rows if r['count']}
+
+
 def _query_top_threat_ips(cur, cutoff, exclude_ips):
     """Top threat IPs with categories from ip_threats and last_seen ISO format."""
     cur.execute(
@@ -316,12 +341,7 @@ def get_stats(
             total = cur.fetchone()['total']
 
             # By type
-            cur.execute(
-                "SELECT log_type, COUNT(*) as count FROM logs "
-                "WHERE timestamp >= %s GROUP BY log_type ORDER BY count DESC",
-                [cutoff]
-            )
-            by_type = {r['log_type']: r['count'] for r in cur.fetchall()}
+            by_type = _query_by_type(cur, cutoff)
 
             # Blocked count
             cur.execute(
@@ -474,13 +494,7 @@ def get_stats_overview(
             """, [cutoff])
             by_direction = {r['direction']: r['count'] for r in cur.fetchall()}
 
-            cur.execute("""
-                SELECT log_type, COUNT(*) AS count
-                FROM logs
-                WHERE timestamp >= %s
-                GROUP BY log_type ORDER BY count DESC
-            """, [cutoff])
-            by_type = {r['log_type']: r['count'] for r in cur.fetchall()}
+            by_type = _query_by_type(cur, cutoff)
 
         conn.commit()
         return {
