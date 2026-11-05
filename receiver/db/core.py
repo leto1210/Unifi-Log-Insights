@@ -1078,6 +1078,13 @@ class Database:
     # ── Retention cleanup ────────────────────────────────────────────────────
 
     RETENTION_BATCH_SIZE = 5_000
+    # Upper bound on rows deleted by ONE cleanup pass (DNS + non-DNS combined).
+    # A multi-day backlog (e.g. after the scheduler missed runs) deleted in one
+    # burst leaves tens of millions of dead tuples; the autovacuum that follows
+    # saturates disk I/O and times out dashboard queries.  The remainder is
+    # picked up by the next pass.  Keep it above the daily ingest volume or the
+    # backlog never drains.  Override with RETENTION_MAX_DELETE_PER_PASS; 0 = no cap.
+    RETENTION_MAX_DELETE_DEFAULT = 5_000_000
     # Only run an explicit VACUUM ANALYZE after cleanup when the number of
     # deleted rows is above this threshold.  Trivial runs (a handful of rows)
     # are handled by tuned autovacuum, avoiding the cost of a full-table scan.
@@ -1094,6 +1101,23 @@ class Database:
     # Monitor pg_stat_user_tables.n_dead_tup post-deploy to verify autovacuum
     # is keeping up when explicit VACUUM is skipped.
     VACUUM_MAX_RETRIES = 2
+
+    @classmethod
+    def resolve_retention_max_delete(cls) -> int:
+        """Return the per-pass delete cap (0 means unlimited).
+
+        Reads RETENTION_MAX_DELETE_PER_PASS; unset, blank or invalid values
+        fall back to RETENTION_MAX_DELETE_DEFAULT, negative values to 0.
+        """
+        raw = os.environ.get('RETENTION_MAX_DELETE_PER_PASS', '').strip()
+        if not raw:
+            return cls.RETENTION_MAX_DELETE_DEFAULT
+        try:
+            return max(0, int(raw))
+        except ValueError:
+            logger.warning("Invalid RETENTION_MAX_DELETE_PER_PASS=%r; using default %d",
+                           raw, cls.RETENTION_MAX_DELETE_DEFAULT)
+            return cls.RETENTION_MAX_DELETE_DEFAULT
 
     @staticmethod
     def validate_retention_days(general_days: int, dns_days: int):
@@ -1216,13 +1240,16 @@ class Database:
 
         Returns:
             Structured result dict with keys: status, dns_deleted,
-            non_dns_deleted, deleted_so_far, batches_completed, error.
+            non_dns_deleted, deleted_so_far, batches_completed, capped, error.
+            ``capped`` is True when the per-pass delete cap stopped the run
+            early; the remainder is deleted by the next pass.
         """
         from datetime import datetime, timezone, timedelta
 
         self.validate_retention_days(general_days, dns_days)
 
         batch_size = self.RETENTION_BATCH_SIZE
+        max_delete = self.resolve_retention_max_delete()
         now = datetime.now(timezone.utc)
         passes = [
             ("dns",     "log_type = 'dns'",  now - timedelta(days=dns_days)),
@@ -1235,12 +1262,16 @@ class Database:
             'non_dns_deleted': 0,
             'deleted_so_far': 0,
             'batches_completed': 0,
+            'capped': False,
             'error': None,
         }
 
         try:
             for label, type_filter, cutoff in passes:
-                while True:
+                while not result['capped']:
+                    limit = batch_size
+                    if max_delete:
+                        limit = min(batch_size, max_delete - result['deleted_so_far'])
                     with self.get_conn() as conn:
                         with conn.cursor() as cur:
                             # type_filter is from the hardcoded passes list
@@ -1254,7 +1285,7 @@ class Database:
                                 f"  LIMIT %s"
                                 f"  FOR UPDATE SKIP LOCKED"
                                 f")",
-                                [cutoff, batch_size],
+                                [cutoff, limit],
                             )
                             n = cur.rowcount
                     if n == 0:
@@ -1264,6 +1295,8 @@ class Database:
                     result['batches_completed'] += 1
                     logger.debug("Retention %s: batch %d — deleted %d rows",
                                  label, result['batches_completed'], n)
+                    if max_delete and result['deleted_so_far'] >= max_delete:
+                        result['capped'] = True
                     if progress_cb:
                         progress_cb({**result, 'phase': label})
         except Exception as exc:
@@ -1272,6 +1305,11 @@ class Database:
             logger.error("Retention cleanup %s: %d rows deleted before error: %s",
                          result['status'], result['deleted_so_far'], exc)
             return result
+
+        if result['capped']:
+            logger.warning("Retention cleanup hit the per-pass cap of %d rows; "
+                           "the remaining expired rows will be deleted by the next pass",
+                           max_delete)
 
         # Always log completion — including zero-row runs — so operators can
         # confirm the cleanup fired even on quiet days. Previously gated on
@@ -1352,6 +1390,25 @@ class Database:
                         vac_conn.close()
                     except psycopg2.Error as close_exc:
                         logger.debug("Error closing VACUUM connection: %s", close_exc)
+
+    ANALYZE_TIMEOUT_SECS = 120
+
+    def run_analyze(self) -> None:
+        """Run ANALYZE on the logs table to refresh planner statistics.
+
+        Same ephemeral autocommit connection pattern as _run_explicit_vacuum
+        (ANALYZE does not need a transaction and must not leak autocommit to
+        the pool).  Unlike the post-cleanup VACUUM this is user-triggered, so
+        failures propagate to the caller.
+        """
+        conn = psycopg2.connect(**self.conn_params)
+        try:
+            conn.autocommit = True
+            with conn.cursor() as cur:
+                cur.execute("SET statement_timeout = %s", [f"{self.ANALYZE_TIMEOUT_SECS}s"])
+                cur.execute("ANALYZE logs")
+        finally:
+            conn.close()
 
     def get_stats(self) -> dict:
         """Get basic stats for health check / logging."""

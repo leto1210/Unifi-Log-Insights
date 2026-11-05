@@ -4,6 +4,7 @@ import ipaddress as _ipaddress
 import logging
 import os
 import threading
+import time
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -985,6 +986,32 @@ def run_retention_cleanup_now():
     t.start()
     return {"success": True, "status": "running", "general_days": general, "dns_days": dns,
             "batch_size": Database.RETENTION_BATCH_SIZE}
+
+
+_analyze_lock = threading.Lock()
+
+
+@router.post("/api/config/retention/analyze")
+def run_analyze_now():
+    """Run ANALYZE on the logs table now (refreshes planner statistics).
+
+    Synchronous — takes seconds on a large table.  Useful after a big
+    retention delete, when stale statistics can make dashboard queries time out.
+    """
+    if not _analyze_lock.acquire(blocking=False):
+        raise HTTPException(status_code=409, detail="ANALYZE already in progress")
+    try:
+        started = time.monotonic()
+        try:
+            enricher_db.run_analyze()
+        except Exception as e:
+            logger.error("Manual ANALYZE failed: %s", e)
+            raise HTTPException(status_code=500, detail="ANALYZE failed") from None
+        duration = round(time.monotonic() - started, 1)
+        logger.info("Manual ANALYZE logs complete in %.1fs", duration)
+        return {"success": True, "duration_s": duration}
+    finally:
+        _analyze_lock.release()
 
 
 @router.get("/api/config/retention/cleanup-status")

@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useMemo, useCallback } from 'react'
 import {
-  fetchRetentionConfig, updateRetentionConfig, runRetentionCleanup, fetchRetentionCleanupStatus,
+  fetchRetentionConfig, updateRetentionConfig, runRetentionCleanup, runAnalyze, fetchRetentionCleanupStatus,
   exportConfig, importConfig,
   testMigrationConnection, startMigration, getMigrationStatus,
   patchMigrationCompose,
@@ -509,6 +509,7 @@ export default function SettingsDataBackups({ totalLogs, storage, onSaved }) {
   const [retentionLoading, setRetentionLoading] = useState(true)
   const [retentionLoadError, setRetentionLoadError] = useState(null)
   const [showCleanup, setShowCleanup] = useState(false)
+  const [analyzing, setAnalyzing] = useState(false)
   const [cleanupJob, setCleanupJob] = useState(null) // null | { status, deleted_so_far, ... }
   const cleanupPollRef = useRef(null)
 
@@ -697,6 +698,23 @@ export default function SettingsDataBackups({ totalLogs, storage, onSaved }) {
       } else {
         setRetentionMsg({ type: 'error', text: 'Failed to start cleanup: ' + e.message })
       }
+    }
+  }
+
+  async function handleAnalyzeNow() {
+    setRetentionMsg(null)
+    setAnalyzing(true)
+    try {
+      const { duration_s } = await runAnalyze()
+      setRetentionMsg({ type: 'success', text: `Statistics refreshed (${duration_s}s)` })
+      setTimeout(() => setRetentionMsg(null), 3000)
+    } catch (e) {
+      setRetentionMsg({
+        type: 'error',
+        text: e.status === 409 ? 'Analyze already in progress' : 'Analyze failed: ' + e.message,
+      })
+    } finally {
+      setAnalyzing(false)
     }
   }
 
@@ -998,6 +1016,16 @@ export default function SettingsDataBackups({ totalLogs, storage, onSaved }) {
                 <span className={`text-sm ${retentionMsg.type === 'success' ? 'text-emerald-400' : 'text-red-400'}`}>
                   {retentionMsg.text}
                 </span>
+              )}
+              {showCleanup && (
+                <button
+                  data-testid="retention-analyze-button"
+                  onClick={handleAnalyzeNow}
+                  disabled={analyzing}
+                  className="px-4 py-1.5 rounded text-sm font-medium border border-gray-600 text-gray-300 hover:bg-gray-700/40 transition-colors disabled:opacity-50"
+                >
+                  {analyzing ? 'Analyzing...' : 'Refresh Statistics'}
+                </button>
               )}
               {showCleanup && (
                 <button

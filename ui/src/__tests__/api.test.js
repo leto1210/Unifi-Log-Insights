@@ -15,6 +15,7 @@ import {
   getExportUrl,
   createSavedView,
   runRetentionCleanup,
+  runAnalyze,
   fetchRetentionCleanupStatus,
 } from '../api'
 
@@ -268,6 +269,19 @@ describe('runRetentionCleanup', () => {
     expect(url).toBe('/api/config/retention/cleanup')
     expect(opts.method).toBe('POST')
     expect(result.status).toBe('running')
+  })
+
+  it('runAnalyze POSTs to the analyze endpoint', async () => {
+    vi.stubGlobal('fetch', vi.fn(() => Promise.resolve({
+      ok: true,
+      json: () => Promise.resolve({ success: true, duration_s: 1.2 }),
+    })))
+
+    const result = await runAnalyze()
+    const [url, opts] = fetch.mock.calls[0]
+    expect(url).toBe('/api/config/retention/analyze')
+    expect(opts.method).toBe('POST')
+    expect(result.duration_s).toBe(1.2)
   })
 
   it('throws on error response', async () => {
