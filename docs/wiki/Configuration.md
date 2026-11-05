@@ -117,8 +117,13 @@ host binding, the API refuses to include it until the association is repaired.
 | `DNS_RETENTION_DAYS` | `10` | DNS logs retention (shorter — they're voluminous). |
 | `RETENTION_CLEANUP_TIME` | `03:00` | Daily cleanup start time, `HH:MM` container-local. |
 | `RETENTION_TIME` | *(deprecated)* | Legacy alias for `RETENTION_CLEANUP_TIME`. Warns once at boot, will be removed. |
+| `RETENTION_MAX_DELETE_PER_PASS` | `5000000` | Maximum rows one cleanup pass may delete (DNS + non-DNS combined). `0` = unlimited. Keep it above your daily ingest volume, otherwise a backlog never drains. |
 
 Retention cleanup runs in batches with `SKIP LOCKED` to avoid blocking ingestion. Autovacuum is tuned to reclaim dead tuples promptly (`scale_factor=0.01` on the logs table).
+
+A pass stops once it has deleted `RETENTION_MAX_DELETE_PER_PASS` rows and logs a warning (`Retention cleanup hit the per-pass cap`); the next pass (the daily run, the startup run, or **Run Cleanup Now**) deletes the rest. This bounds the dead-tuple burst — and the autovacuum I/O it triggers — after a backlog builds up, for example when the receiver was stopped or the scheduler missed runs.
+
+**Refresh Statistics** (Settings > Data, next to *Run Cleanup Now*, or `POST /api/config/retention/analyze`) runs `ANALYZE logs` on demand. Use it after a large delete if dashboard queries are slow because the planner statistics are stale. It returns `409` if one is already running.
 
 ## Pi-hole integration
 
