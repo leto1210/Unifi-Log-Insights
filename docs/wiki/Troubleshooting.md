@@ -39,6 +39,14 @@ Older images (before v3.8.0-beta.3) crashed the bulk toggle with `KeyError: 'id'
 
 Benign — the schema migration retries on rare startup races between the receiver and the API process both trying to run `_ensure_schema` at the same time. There's an advisory lock but the second process still tries the DDL before giving up. If the container comes up healthy afterwards, ignore.
 
+## Dashboard shows "Failed to load…" after a large retention delete
+
+Symptom: `/api/stats/*` (and 24h/7d map queries) return `500` with `QueryCanceled: canceling statement due to statement timeout` in the app log, shortly after a retention run that deleted millions of rows.
+
+Cause: the delete left tens of millions of dead tuples; the autovacuum that follows saturates disk I/O and, until autoanalyze runs, the planner statistics are stale. Check progress with `SELECT phase, heap_blks_scanned, heap_blks_vacuumed, heap_blks_total FROM pg_stat_progress_vacuum;` and `n_dead_tup` / `last_autoanalyze` in `pg_stat_user_tables`.
+
+What to do: use the 1h/6h ranges until the vacuum finishes (can take 45+ minutes on ~80M rows), then click **Refresh Statistics** in Settings > Data if `last_autoanalyze` is still empty. To avoid a single huge burst, `RETENTION_MAX_DELETE_PER_PASS` (default 5M rows) caps each pass — see [Configuration](Configuration.md#retention).
+
 ## Retention cleanup log shows deletes but disk usage doesn't drop
 
 Autovacuum reclaim is scheduled aggressively (`scale_factor=0.01`) but VACUUM only frees space to the filesystem when it can truncate the trailing empty pages. Between big cleanups you'll see WAL and dead tuples pile up. The container runs an explicit `VACUUM ANALYZE logs` after any cleanup that deletes more than `VACUUM_MIN_DELETED` rows (see `receiver/db.py`).

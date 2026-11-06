@@ -901,3 +901,67 @@ def test_run_retention_cleanup_progress_callback(monkeypatch):
     assert result['status'] == 'complete'
     assert len(progress_calls) >= 1
     assert progress_calls[0]['phase'] == 'dns'
+
+
+def _capped_database(monkeypatch, dns, non_dns, cap):
+    """Build a Database whose fake retention conn honours the LIMIT param."""
+    database = Database(conn_params={'user': 'unifi'})
+    remaining = {'dns': dns, 'non_dns': non_dns}
+    limits = []
+
+    class LimitCursor(FakeRetentionCursor):
+        """Cursor that consumes at most the LIMIT bound by the real query."""
+
+        def execute(self, sql, params=None):
+            """Delete min(remaining, LIMIT) rows from the matching bucket."""
+            label = 'dns' if "log_type = 'dns'" in sql else 'non_dns'
+            limits.append(params[1])
+            self.rowcount = min(remaining[label], params[1])
+            remaining[label] -= self.rowcount
+
+    class LimitConn(FakeRetentionConn):
+        """Connection handing out LimitCursor instances."""
+
+        def cursor(self):
+            """Return a LimitCursor."""
+            return LimitCursor(self)
+
+    @contextmanager
+    def fake_get_conn():
+        """Yield a fake retention connection."""
+        yield LimitConn()
+
+    monkeypatch.setattr(database, 'get_conn', fake_get_conn)
+    monkeypatch.setattr(database, '_run_explicit_vacuum', lambda: None)
+    monkeypatch.setenv('RETENTION_MAX_DELETE_PER_PASS', str(cap))
+    return database, remaining, limits
+
+
+def test_run_retention_cleanup_stops_at_cap(monkeypatch):
+    """A pass deletes at most the cap (last batch shrunk) and reports capped."""
+    database, remaining, limits = _capped_database(monkeypatch, 3000, 20000, cap=12000)
+    result = database.run_retention_cleanup(60, 10)
+    assert result['deleted_so_far'] == 12000
+    assert result['dns_deleted'] == 3000
+    assert result['non_dns_deleted'] == 9000
+    assert result['capped'] is True
+    assert remaining['non_dns'] == 11000
+    assert max(limits) <= 5000
+
+
+def test_run_retention_cleanup_cap_zero_is_unlimited(monkeypatch):
+    """RETENTION_MAX_DELETE_PER_PASS=0 removes the cap."""
+    database, remaining, _ = _capped_database(monkeypatch, 0, 20000, cap=0)
+    result = database.run_retention_cleanup(60, 10)
+    assert result['deleted_so_far'] == 20000
+    assert result['capped'] is False
+
+
+def test_resolve_retention_max_delete(monkeypatch):
+    """Unset/invalid env falls back to the default; negatives clamp to 0."""
+    monkeypatch.delenv('RETENTION_MAX_DELETE_PER_PASS', raising=False)
+    assert Database.resolve_retention_max_delete() == Database.RETENTION_MAX_DELETE_DEFAULT
+    monkeypatch.setenv('RETENTION_MAX_DELETE_PER_PASS', 'abc')
+    assert Database.resolve_retention_max_delete() == Database.RETENTION_MAX_DELETE_DEFAULT
+    monkeypatch.setenv('RETENTION_MAX_DELETE_PER_PASS', '-5')
+    assert Database.resolve_retention_max_delete() == 0

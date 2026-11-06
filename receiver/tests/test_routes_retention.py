@@ -440,3 +440,34 @@ class TestRetentionTimeImport:
         assert resp.status_code == 200
         data = resp.json()
         assert 'retention_time' in data.get('failed_keys', [])
+
+
+class TestAnalyzeNow:
+    """Tests for POST /api/config/retention/analyze."""
+
+    def test_analyze_ok(self, client):
+        """A successful ANALYZE returns success and a duration."""
+        test_client, mock_deps, _db, _mod = client
+        mock_deps.enricher_db.run_analyze = MagicMock()
+        resp = test_client.post('/api/config/retention/analyze')
+        assert resp.status_code == 200
+        assert resp.json()['success'] is True
+        mock_deps.enricher_db.run_analyze.assert_called_once()
+
+    def test_analyze_failure_returns_500(self, client):
+        """A DB error surfaces as 500 without leaking details."""
+        test_client, mock_deps, _db, _mod = client
+        mock_deps.enricher_db.run_analyze = MagicMock(side_effect=RuntimeError('boom'))
+        resp = test_client.post('/api/config/retention/analyze')
+        assert resp.status_code == 500
+        assert 'boom' not in resp.text
+
+    def test_analyze_409_when_running(self, client):
+        """A second request while one is running is rejected."""
+        test_client, _deps, _db, setup_mod = client
+        assert setup_mod._analyze_lock.acquire(blocking=False)
+        try:
+            resp = test_client.post('/api/config/retention/analyze')
+            assert resp.status_code == 409
+        finally:
+            setup_mod._analyze_lock.release()
