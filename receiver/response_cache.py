@@ -21,6 +21,7 @@ are never requested again.
 Test hooks: `clear_cache()` empties every bucket; `_cache` is the shared store.
 """
 
+import contextlib
 import copy
 import functools
 import threading
@@ -80,6 +81,27 @@ class _TTLCache:
 
 _cache = _TTLCache()
 
+# Single-flight: one lock per key currently being computed, with a count of
+# threads using it so the entry is removed when the last one leaves.
+_inflight = {}
+_inflight_guard = threading.Lock()
+
+
+@contextlib.contextmanager
+def _key_lock(key):
+    """Hold the per-key computation lock; other keys are never blocked."""
+    with _inflight_guard:
+        entry = _inflight.setdefault(key, [threading.Lock(), 0])
+        entry[1] += 1
+    try:
+        with entry[0]:
+            yield
+    finally:
+        with _inflight_guard:
+            entry[1] -= 1
+            if not entry[1]:
+                del _inflight[key]
+
 
 def ttl_cache(ttl=30.0):
     """Cache a handler's return value for `ttl` seconds, keyed on its call args.
@@ -88,6 +110,11 @@ def ttl_cache(ttl=30.0):
     params: the cache key is (qualified name, positional args, sorted kwargs).
     Values are deep-copied on read so downstream mutation can't poison the next
     hit; exceptions propagate without being cached.
+
+    Concurrent misses on the same key are single-flight: one caller computes,
+    the others wait and reuse its result instead of each running the same
+    heavy query (dashboard tiers on expiry, several open tabs). If it raises,
+    the next waiter computes in turn.
     """
     def decorator(fn):
         """Wrap fn with the shared args-keyed TTL cache."""
@@ -95,14 +122,18 @@ def ttl_cache(ttl=30.0):
 
         @functools.wraps(fn)
         def wrapper(*args, **kwargs):
-            """Return a cached copy or call fn and cache a copy of the result."""
+            """Return a cached copy or call fn (once per key at a time) and cache a copy."""
             key = (qualname, args, tuple(sorted(kwargs.items())))
             hit = _cache.get(key)
             if hit is not None:
                 return copy.deepcopy(hit)
-            result = fn(*args, **kwargs)
-            _cache.set(key, copy.deepcopy(result), ttl)
-            return result
+            with _key_lock(key):
+                hit = _cache.get(key)  # filled while we waited
+                if hit is not None:
+                    return copy.deepcopy(hit)
+                result = fn(*args, **kwargs)
+                _cache.set(key, copy.deepcopy(result), ttl)
+                return result
         return wrapper
     return decorator
 

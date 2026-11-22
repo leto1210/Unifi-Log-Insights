@@ -13,6 +13,7 @@ import pytest
 
 @pytest.fixture(autouse=True)
 def _clear_between_tests():
+    """Start and end every test with an empty shared cache."""
     from routes._response_cache import clear_cache
     clear_cache()
     yield
@@ -20,12 +21,14 @@ def _clear_between_tests():
 
 
 def test_second_call_within_ttl_skips_function():
+    """A second call inside the TTL is served from cache."""
     from routes._response_cache import ttl_cache
 
     calls = []
 
     @ttl_cache(ttl=60)
     def handler(time_range: str = "24h"):
+        """Test handler under the cache decorator."""
         calls.append(time_range)
         return {"value": time_range}
 
@@ -35,12 +38,14 @@ def test_second_call_within_ttl_skips_function():
 
 
 def test_different_kwargs_are_different_keys():
+    """Different kwargs map to different cache entries."""
     from routes._response_cache import ttl_cache
 
     calls = []
 
     @ttl_cache(ttl=60)
     def handler(time_range: str = "24h"):
+        """Test handler under the cache decorator."""
         calls.append(time_range)
         return {"value": time_range}
 
@@ -62,6 +67,7 @@ def test_expired_entry_is_recomputed(monkeypatch):
 
     @rc.ttl_cache(ttl=30)
     def handler(time_range: str = "24h"):
+        """Test handler under the cache decorator."""
         calls.append(now[0])
         return {"t": now[0]}
 
@@ -74,12 +80,14 @@ def test_expired_entry_is_recomputed(monkeypatch):
 
 
 def test_exception_is_not_cached():
+    """A raising call is retried, never cached."""
     from routes._response_cache import ttl_cache
 
     attempts = []
 
     @ttl_cache(ttl=60)
     def handler(time_range: str = "24h"):
+        """Test handler under the cache decorator."""
         attempts.append(time_range)
         raise RuntimeError("boom")
 
@@ -96,6 +104,7 @@ def test_cached_value_isolated_from_caller_mutations():
 
     @ttl_cache(ttl=60)
     def handler():
+        """Test handler under the cache decorator."""
         return {"items": [1, 2, 3]}
 
     first = handler()
@@ -105,12 +114,14 @@ def test_cached_value_isolated_from_caller_mutations():
 
 
 def test_clear_cache_empties_everything():
+    """clear_cache() drops every entry."""
     from routes._response_cache import ttl_cache, clear_cache
 
     calls = []
 
     @ttl_cache(ttl=60)
     def handler(time_range: str = "24h"):
+        """Test handler under the cache decorator."""
         calls.append(time_range)
         return {"v": time_range}
 
@@ -220,3 +231,53 @@ def test_concurrent_insertions_keep_shared_store_bounded():
             {"key": key} for key in range(2_000)
         ]
     assert len(_cache._store) == _cache._max_entries
+
+
+def test_concurrent_misses_on_one_key_compute_once():
+    """Single-flight: N simultaneous misses on the same key run the handler once."""
+    from response_cache import _inflight, ttl_cache
+
+    calls = []
+
+    @ttl_cache(ttl=60)
+    def handler(key):
+        """Slow handler counting its executions."""
+        calls.append(key)
+        time.sleep(0.2)
+        return {"key": key}
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(handler, ["same"] * 8))
+    assert calls == ["same"]
+    assert results == [{"key": "same"}] * 8
+    assert _inflight == {}
+
+
+def test_waiter_recomputes_when_the_first_computation_fails():
+    """An exception is not shared: the next waiter computes, and locks are released."""
+    from response_cache import _inflight, ttl_cache
+
+    started, release = Event(), Event()
+    attempts = []
+
+    @ttl_cache(ttl=60)
+    def handler(key):
+        """First call fails after a pause, later calls succeed."""
+        attempts.append(key)
+        if len(attempts) == 1:
+            started.set()
+            assert release.wait(5)
+            raise RuntimeError("db down")
+        return key
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(handler, "k")
+        assert started.wait(5)
+        second = pool.submit(handler, "k")
+        time.sleep(0.05)  # second is now waiting on the key lock
+        release.set()
+        with pytest.raises(RuntimeError):
+            first.result(timeout=5)
+        assert second.result(timeout=5) == "k"
+    assert len(attempts) == 2
+    assert _inflight == {}
