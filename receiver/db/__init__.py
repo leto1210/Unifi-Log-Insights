@@ -51,6 +51,7 @@ from .config import (
 )
 from .exceptions import AdGuardHostMismatch
 from .logs_sql import INSERT_COLUMNS, INSERT_SQL, count_logs
+from .partitioning import LOGS_ROW_ESTIMATE_SQL
 from .retention import (
     RETENTION_TIME_DEFAULT,
     RetentionDaysConfig,
@@ -75,6 +76,7 @@ __all__ = [
     'Database',
     'INSERT_COLUMNS',
     'INSERT_SQL',
+    'LOGS_ROW_ESTIMATE_SQL',
     'RETENTION_TIME_DEFAULT',
     'RetentionDaysConfig',
     'RetentionTimeConfig',

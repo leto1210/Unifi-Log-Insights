@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, HTTPException
 
-from db import Database, get_config, is_external_db
+from db import Database, LOGS_ROW_ESTIMATE_SQL, get_config, is_external_db
 from enrichment import get_abuseipdb_stats
 from deps import get_conn, put_conn, enricher_db, APP_VERSION
 
@@ -26,13 +26,8 @@ def health():
             # On large tables (100M+ rows) the exact COUNT takes 5-7s per call and
             # causes persistent /api/health 503 errors via statement_timeout.
             # reltuples is updated by autovacuum and accurate to ~1% on active tables.
-            cur.execute("""
-                SELECT COALESCE(GREATEST(c.reltuples::bigint, 0), 0)
-                FROM pg_class c
-                JOIN pg_namespace n ON n.oid = c.relnamespace
-                WHERE c.relname = 'logs'
-                  AND n.nspname = 'public'
-            """)
+            # Summed over leaf partitions when logs is partitioned.
+            cur.execute(LOGS_ROW_ESTIMATE_SQL)
             row = cur.fetchone()
             total = row[0] if row else 0
 

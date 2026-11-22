@@ -1,7 +1,10 @@
 -- UniFi Log Insight schema
 
+-- Partitioned by UTC day (receiver/db/partitioning.py). No PRIMARY KEY: on a
+-- partitioned table it would have to include timestamp; idx_logs_id serves id
+-- lookups. The receiver creates logs_default and the day partitions at boot.
 CREATE TABLE IF NOT EXISTS logs (
-    id          BIGSERIAL PRIMARY KEY,
+    id          BIGSERIAL NOT NULL,
     timestamp   TIMESTAMPTZ NOT NULL,
     log_type    VARCHAR(20) NOT NULL,  -- firewall, dhcp, dns, wifi, ids
     direction   VARCHAR(20),           -- inbound, outbound, inter_vlan, nat
@@ -42,9 +45,10 @@ CREATE TABLE IF NOT EXISTS logs (
     dst_device_name TEXT,
     raw_log     TEXT NOT NULL,
     created_at  TIMESTAMPTZ DEFAULT NOW()
-);
+) PARTITION BY RANGE (timestamp);
 
 -- Performance indexes
+CREATE INDEX IF NOT EXISTS idx_logs_id           ON logs (id);
 CREATE INDEX IF NOT EXISTS idx_logs_timestamp    ON logs (timestamp DESC);
 CREATE INDEX IF NOT EXISTS idx_logs_src_ip       ON logs (src_ip);
 CREATE INDEX IF NOT EXISTS idx_logs_dst_ip       ON logs (dst_ip);
@@ -122,14 +126,23 @@ CREATE INDEX IF NOT EXISTS idx_logs_nondns_timestamp
 -- Default scale_factor=0.2 means autovacuum waits until 20% of rows are dead
 -- before reclaiming space. On a large table that threshold is never reached
 -- quickly enough after batch deletes, causing unbounded bloat (issue #92).
-ALTER TABLE logs SET (
-    autovacuum_vacuum_scale_factor  = 0.01,
-    autovacuum_vacuum_cost_delay    = 2,
-    autovacuum_analyze_scale_factor = 0.02,
-    -- Higher I/O budget per autovacuum worker: lets it process more pages per
-    -- delay cycle and keep pace with high-ingestion dead-tuple accumulation.
-    autovacuum_vacuum_cost_limit    = 10000
-);
+-- Plain (pre-partitioning) table only: PostgreSQL rejects storage parameters
+-- on a partitioned parent, and day partitions only see edge DELETEs.
+DO $$
+BEGIN
+    IF (SELECT c.relkind FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'public' AND c.relname = 'logs') = 'r' THEN
+        ALTER TABLE logs SET (
+            autovacuum_vacuum_scale_factor  = 0.01,
+            autovacuum_vacuum_cost_delay    = 2,
+            autovacuum_analyze_scale_factor = 0.02,
+            -- Higher I/O budget per autovacuum worker: lets it process more pages per
+            -- delay cycle and keep pace with high-ingestion dead-tuple accumulation.
+            autovacuum_vacuum_cost_limit    = 10000
+        );
+    END IF;
+END $$;
 
 -- Log autovacuum operations that take longer than 60 s on this database.
 -- This lets operators verify the scale_factor tuning is firing as expected

@@ -28,26 +28,30 @@ def _log_based_wan_detection_active(db):
 # Optional 'when' key: a predicate (db) -> bool. When present and it returns
 # False, the index is not wanted on this install — ensure_post_boot_indexes()
 # drops it if present rather than creating it.
+# 'def' is the part after `ON logs`: on a partitioned logs, where CONCURRENTLY
+# is impossible on the parent, partitioning.create_index_online() builds it
+# per partition from that definition instead of running 'sql'.
+def _post_boot_index(name, definition, label, when=None):
+    """One POST_BOOT_INDEXES entry; 'sql' is the plain-table CONCURRENTLY form."""
+    entry = {
+        'name': name,
+        'def': definition,
+        'sql': f"CREATE INDEX CONCURRENTLY IF NOT EXISTS {name} ON logs {definition}",
+        'label': label,
+    }
+    if when is not None:
+        entry['when'] = when
+    return entry
+
+
 POST_BOOT_INDEXES = [
-    {
-        'name': 'idx_logs_spgist_dst_ip_firewall',
-        'sql': "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_logs_spgist_dst_ip_firewall "
-               "ON logs USING spgist (dst_ip) WHERE log_type = 'firewall'",
-        'label': 'SP-GiST dst_ip for WAN detection',
-        'when': _log_based_wan_detection_active,
-    },
-    {
-        'name': 'idx_logs_type_id',
-        'sql': "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_logs_type_id "
-               "ON logs (log_type, id)",
-        'label': 'type+id for purge batches',
-    },
-    {
-        'name': 'idx_logs_nondns_timestamp',
-        'sql': "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_logs_nondns_timestamp "
-               "ON logs (timestamp DESC) WHERE log_type != 'dns'",
-        'label': 'non-DNS retention cleanup',
-    },
+    _post_boot_index('idx_logs_spgist_dst_ip_firewall',
+                     "USING spgist (dst_ip) WHERE log_type = 'firewall'",
+                     'SP-GiST dst_ip for WAN detection',
+                     when=_log_based_wan_detection_active),
+    _post_boot_index('idx_logs_type_id', "(log_type, id)", 'type+id for purge batches'),
+    _post_boot_index('idx_logs_nondns_timestamp', "(timestamp DESC) WHERE log_type != 'dns'",
+                     'non-DNS retention cleanup'),
 ]
 
 # Redundant / unused indexes dropped on upgrade. DROP CONCURRENTLY IF EXISTS
