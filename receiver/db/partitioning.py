@@ -109,6 +109,34 @@ def _create_day_partition(cur, day: date) -> None:
         logger.info("Partition %s created", name)
 
 
+def heal_stale_bound(cur, now: datetime | None = None) -> list[str]:
+    """Drop a leftover migration CHECK on a still-plain logs before it breaks INSERTs.
+
+    db.migrate_partitions adds CHECK (timestamp < cutover) named
+    logs_legacy_before_YYYYMMDD shortly before its swap. If the migration
+    was killed in between, every row at/after the cutover would be rejected
+    once that date arrives; drop the CHECK when the cutover is under a day
+    away (re-running the migration picks a new cutover). Caller's transaction.
+    """
+    now = now or datetime.now(timezone.utc)
+    cur.execute("SELECT conname FROM pg_constraint WHERE conrelid = 'public.logs'::regclass "
+                "AND conname LIKE 'logs_legacy_before_%'")
+    dropped = []
+    for (name,) in cur.fetchall():
+        try:
+            cutover = datetime.strptime(name[-8:], '%Y%m%d').replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+        if cutover - now < timedelta(days=1):
+            cur.execute(f"SET LOCAL lock_timeout = '{DDL_LOCK_TIMEOUT}'")
+            cur.execute(f"ALTER TABLE logs DROP CONSTRAINT {name}")
+            logger.error("Dropped %s: an interrupted partition migration left it armed and its "
+                         "cutover is under a day away. Re-run `python -m db.migrate_partitions --yes`.",
+                         name)
+            dropped.append(name)
+    return dropped
+
+
 def ensure_partitions(db, days_ahead: int = DAYS_AHEAD, today: date | None = None) -> list[str]:
     """Create missing day partitions from today to today + days_ahead.
 
@@ -120,12 +148,18 @@ def ensure_partitions(db, days_ahead: int = DAYS_AHEAD, today: date | None = Non
     with db.get_conn() as conn:
         with conn.cursor() as cur:
             if not is_partitioned(cur):
+                heal_stale_bound(cur)
                 return []
-            existing = {name for name, _ in partition_bounds(cur)}
+            bounds = partition_bounds(cur)
+    existing = {name for name, _ in bounds}
+    # logs_legacy covers everything before the cutover: those days have no partition.
+    legacy_upper = next((upper for name, upper in bounds if name == LEGACY_PARTITION), None)
     created = []
     for offset in range(days_ahead + 1):
         day = today + timedelta(days=offset)
         if partition_name(day) in existing:
+            continue
+        if legacy_upper is not None and day_bounds(day)[0] < legacy_upper:
             continue
         try:
             with db.get_conn() as conn:
