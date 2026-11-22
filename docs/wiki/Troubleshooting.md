@@ -47,6 +47,8 @@ Cause: the delete left tens of millions of dead tuples; the autovacuum that foll
 
 What to do: use the 1h/6h ranges until the vacuum finishes (can take 45+ minutes on ~80M rows), then click **Refresh Statistics** in Settings > Data if `last_autoanalyze` is still empty. To avoid a single huge burst, `RETENTION_MAX_DELETE_PER_PASS` (default 5M rows) caps each pass — see [Configuration](Configuration.md#retention).
 
+Lasting fix: migrate the table to daily partitions, so retention drops whole days instead of deleting rows — see [Logs table partitioning](Logs-Partitioning).
+
 ## Retention cleanup log shows deletes but disk usage doesn't drop
 
 Autovacuum reclaim is scheduled aggressively (`scale_factor=0.01`) but VACUUM only frees space to the filesystem when it can truncate the trailing empty pages. Between big cleanups you'll see WAL and dead tuples pile up. The container runs an explicit `VACUUM ANALYZE logs` after any cleanup that deletes more than `VACUUM_MIN_DELETED` rows (see `receiver/db.py`).

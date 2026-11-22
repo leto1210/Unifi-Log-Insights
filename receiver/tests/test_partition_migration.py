@@ -6,9 +6,11 @@ pre-partitioning table through the real boot path, so every production index
 exists, then migrate it.
 """
 
+import re
 import threading
 import time
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 
@@ -258,3 +260,51 @@ def test_refuses_when_rows_are_dated_after_the_cutover(fresh_db):
     with raw.cursor() as cur:
         with pytest.raises(mp.MigrationError, match='DELETE FROM logs WHERE timestamp >='):
             mp.inspect_plan(cur)
+
+
+# ── The wiki's post-swap rollback, executed verbatim ─────────────────────────
+
+WIKI_PAGE = Path(__file__).resolve().parents[2] / 'docs' / 'wiki' / 'Logs-Partitioning.md'
+
+
+def _wiki_rollback_sql():
+    """The SQL block that follows the `<!-- rollback-sql -->` marker in the wiki page."""
+    text = WIKI_PAGE.read_text()
+    m = re.search(r'<!-- rollback-sql -->\s*```sql\n(.*?)```', text, re.S)
+    assert m, "rollback SQL block not found in the wiki page"
+    return m.group(1)
+
+
+@pg
+def test_wiki_rollback_restores_a_plain_table(fresh_db, caplog):
+    """After a swap and post-cutover rows, the documented SQL gives back the original
+    plain table: every row, original index names, PK, a working sequence, clean boot."""
+    db, raw = _plain_install(fresh_db)
+    original_indexes = set(_parent_indexes(raw))
+    summary = mp.migrate(raw, out=lambda _l: None)
+    cutover = summary['cutover']
+    assert _insert(raw, cutover + timedelta(hours=3)) == partitioning.partition_name(cutover.date())
+    assert _insert(raw, cutover + timedelta(days=40)) == 'logs_default'
+    rows = _one(raw, "SELECT count(*) FROM logs")
+    copied = _one(raw, "SELECT count(*) FROM logs WHERE tableoid <> 'logs_legacy'::regclass")
+    assert copied == 2
+
+    with raw.cursor() as cur:
+        cur.execute(_wiki_rollback_sql())
+
+    assert _one(raw, "SELECT relkind FROM pg_class WHERE relname = 'logs'") == 'r'
+    assert _one(raw, "SELECT count(*) FROM logs") == rows
+    assert set(_parent_indexes(raw)) == original_indexes  # names back, extra id index gone
+    assert _one(raw, "SELECT to_regclass('public.logs_default')") is None
+    assert _one(raw, "SELECT count(*) FROM pg_constraint WHERE conname LIKE 'logs_legacy_before_%'") == 0
+    assert _one(raw, "SELECT pg_get_serial_sequence('logs', 'id')") == 'public.logs_id_seq'
+    assert _insert(raw, datetime.now(timezone.utc)) == 'logs'
+    assert _boot_warnings(caplog, db._ensure_schema) == []
+    assert _boot_warnings(caplog, db.ensure_post_boot_indexes) == []
+    # ...and the migration can be run again later. The two synthetic rows dated
+    # after the (still future) cutover would rightly be refused; in real life
+    # they are in the past by the time anyone rolls back.
+    with raw.cursor() as cur:
+        cur.execute("DELETE FROM logs WHERE timestamp >= %s", [cutover])
+    assert mp.migrate(raw, out=lambda _l: None)['already_done'] is False
+    assert _one(raw, "SELECT relkind FROM pg_class WHERE relname = 'logs'") == 'p'
