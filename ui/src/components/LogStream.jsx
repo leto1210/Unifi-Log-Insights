@@ -4,6 +4,10 @@ import { TR_KEY } from '../utils'
 import FilterBar from './FilterBar'
 import LogTable from './LogTable'
 import Pagination from './Pagination'
+import usePoll from '../hooks/usePoll'
+
+// Live refresh cadence; each tick waits for the previous response.
+const POLL_MS = 5000
 
 const DEFAULT_FILTERS = {
   time_range: '24h',
@@ -91,7 +95,6 @@ export default function LogStream({ version, latestRelease, maxFilterDays, drill
   const columnsMenuRef = useRef(null)
   const filtersRef = useRef(filters)
   filtersRef.current = filters
-  const pendingRef = useRef(null)
   const scrollRef = useRef(null)
   const [showScrollTop, setShowScrollTop] = useState(false)
   const [drillContext, setDrillContext] = useState(null)
@@ -201,25 +204,14 @@ export default function LogStream({ version, latestRelease, maxFilterDays, drill
   // Notify parent of pause state changes
   useEffect(() => { onPauseChange?.(!isRefreshing) }, [isRefreshing, onPauseChange])
 
-  // When paused (manually or by expanding a row), silently check for new logs count
-  useEffect(() => {
-    if (pendingRef.current) clearInterval(pendingRef.current)
-    if (!isRefreshing && filters.page === 1) {
-      pendingRef.current = setInterval(async () => {
-        try {
-          const qs = new URLSearchParams()
-          for (const [k, v] of Object.entries(filters)) {
-            if (v !== null && v !== undefined && v !== '') qs.set(k, v)
-          }
-          qs.set('per_page', '1')
-          const result = await fetchLogs(Object.fromEntries(qs))
-          const diff = result.total - data.total
-          if (diff > 0) setPendingCount(diff)
-        } catch {}
-      }, 5000)
-    }
-    return () => { if (pendingRef.current) clearInterval(pendingRef.current) }
-  }, [isRefreshing, filters, data.total])
+  // When paused (manually or by expanding a row), silently check for new logs count.
+  // Same request as the visible page (not per_page=1) so it shares the API's
+  // 15s response cache instead of forcing an uncached COUNT(*) every tick.
+  usePoll(async () => {
+    const result = await fetchLogs(filters)
+    const diff = result.total - data.total
+    if (diff > 0) setPendingCount(diff)
+  }, POLL_MS, !isRefreshing && filters.page === 1)
 
   // Fetch detail data when a row is expanded
   useEffect(() => {
@@ -272,12 +264,8 @@ export default function LogStream({ version, latestRelease, maxFilterDays, drill
     load(filters)
   }, [filters, load])
 
-  // Auto-refresh every 5s when on page 1 and no row expanded
-  useEffect(() => {
-    if (!isRefreshing || filters.page !== 1) return
-    const id = setInterval(() => load(null, { background: true }), 5000)
-    return () => clearInterval(id)
-  }, [isRefreshing, filters.page, load])
+  // Auto-refresh when on page 1 and no row expanded
+  usePoll(() => load(null, { background: true }), POLL_MS, isRefreshing && filters.page === 1)
 
   const handleFilterChange = (newFilters) => {
     setExpandedId(null)
