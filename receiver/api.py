@@ -14,6 +14,7 @@ from urllib.parse import unquote
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.concurrency import run_in_threadpool
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request as StarletteRequest
 from starlette.responses import Response as StarletteResponse
@@ -193,8 +194,11 @@ class AuthMiddleware(BaseHTTPMiddleware):
             return await call_next(request)
 
         # Delegate to require_auth which knows about public paths, auth state, etc.
+        # It does blocking DB reads (config flag, session/token lookup), so run
+        # it in the threadpool: on the event loop a slow DB or an exhausted pool
+        # (get_conn sleeps between retries) would stall every request.
         try:
-            auth_info = require_auth(request)
+            auth_info = await run_in_threadpool(require_auth, request)
         except HTTPException as exc:
             return JSONResponse(
                 status_code=exc.status_code,
