@@ -9,6 +9,7 @@ from urllib.parse import urlencode
 from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 from psycopg2.extras import RealDictCursor
+from starlette.concurrency import run_in_threadpool
 
 from db import get_config, set_config
 from deps import APP_VERSION, get_conn, put_conn, enricher_db, unifi_api
@@ -727,8 +728,12 @@ def _handle_request(payload: dict, token_info: dict | None) -> dict | None:
     return _jsonrpc_error(-32601, f"Method not found: {method}", rpc_id)
 
 
-async def _handle_jsonrpc(body: Any, token_info: dict | None) -> Response:
-    """Deserialise the request body, call _handle_request, and return a JSON response."""
+def _handle_jsonrpc(body: Any, token_info: dict | None) -> Response:
+    """Deserialise the request body, call _handle_request, and return a JSON response.
+
+    Sync on purpose: tool calls run blocking DB queries (up to the 90 s
+    /api/logs timeout), so callers must run this in the threadpool.
+    """
     if isinstance(body, list):
         return JSONResponse(_jsonrpc_error(-32600, "Batch requests not supported"), status_code=400)
 
@@ -746,9 +751,11 @@ def _require_mcp_enabled():
         raise HTTPException(status_code=404, detail="MCP not enabled")
 
 
-@router.get("/api/mcp")
-async def mcp_get(request: Request):
-    """MCP SSE transport — keeps a persistent event-stream open for the client."""
+def _authorize(request: Request) -> dict:
+    """Run the MCP pre-checks (enabled flag, origin, protocol, token) and return token info.
+
+    Every check reads the DB, so async handlers call this via run_in_threadpool.
+    """
     _require_mcp_enabled()
     _validate_origin(request)
     _validate_protocol_version(request)
@@ -757,6 +764,13 @@ async def mcp_get(request: Request):
     token_info = _lookup_token(token)
     if not token_info:
         raise HTTPException(status_code=401, detail="Unauthorized")
+    return token_info
+
+
+@router.get("/api/mcp")
+async def mcp_get(request: Request):
+    """MCP SSE transport — keeps a persistent event-stream open for the client."""
+    await run_in_threadpool(_authorize, request)
 
     async def _event_stream():
         """Emit a connected event then send keep-alive pings every 15 s."""
@@ -771,21 +785,14 @@ async def mcp_get(request: Request):
 @router.post("/api/mcp")
 async def mcp_post(request: Request):
     """MCP HTTP transport — receive a JSON-RPC request and dispatch to the tool handler."""
-    _require_mcp_enabled()
-    _validate_origin(request)
-    _validate_protocol_version(request)
-
-    token = _get_bearer_token(request)
-    token_info = _lookup_token(token)
-    if not token_info:
-        raise HTTPException(status_code=401, detail="Unauthorized")
+    token_info = await run_in_threadpool(_authorize, request)
 
     try:
         body = await request.json()
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid JSON") from None
 
-    return await _handle_jsonrpc(body, token_info)
+    return await run_in_threadpool(_handle_jsonrpc, body, token_info)
 
 
 # ── Settings + Token Management ─────────────────────────────────────────────
