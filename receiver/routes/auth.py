@@ -6,6 +6,8 @@ import json
 import logging
 import os
 import secrets
+import threading
+import time
 from datetime import datetime, timedelta, timezone
 
 import bcrypt
@@ -398,6 +400,24 @@ def _validate_session(token: str) -> dict | None:
 
 # ── API Token validation ────────────────────────────────────────────────────
 
+# last_used_at is shown at minute precision in Settings; writing it on every
+# authenticated request was one UPDATE per MCP/API call.
+_TOKEN_USE_WRITE_INTERVAL_SECS = 60.0
+_token_use_written: dict[int, float] = {}
+_token_use_lock = threading.Lock()
+
+
+def _should_record_token_use(token_id) -> bool:
+    """True when this token's last_used_at was not written in the last interval (per process)."""
+    now = time.monotonic()
+    with _token_use_lock:
+        last = _token_use_written.get(token_id)
+        if last is not None and now - last < _TOKEN_USE_WRITE_INTERVAL_SECS:
+            return False
+        _token_use_written[token_id] = now
+        return True
+
+
 def _validate_api_token(token: str) -> dict | None:
     """Validate Bearer API token. Returns token+user dict or None."""
     if not token:
@@ -425,8 +445,11 @@ def _validate_api_token(token: str) -> dict | None:
                 if expected and salt:
                     computed = _hmac.new(salt.encode(), token.encode(), 'sha256').hexdigest()
                     if _hmac.compare_digest(computed, expected):
-                        # Update last_used_at
-                        cur.execute("UPDATE api_tokens SET last_used_at = NOW() WHERE id = %s", [row['token_id']])
+                        # At most one last_used_at write per token per minute:
+                        # MCP / integrations authenticate every request.
+                        if _should_record_token_use(row['token_id']):
+                            cur.execute("UPDATE api_tokens SET last_used_at = NOW() WHERE id = %s",
+                                        [row['token_id']])
                         conn.commit()
                         return dict(row)
         conn.commit()
