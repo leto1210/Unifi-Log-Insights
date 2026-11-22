@@ -125,7 +125,7 @@ class Database:
             # Fresh installs get a daily-partitioned table (see db/partitioning.py).
             # No PRIMARY KEY: on a partitioned table it would have to include
             # timestamp; idx_logs_id serves id lookups. Existing plain tables are
-            # untouched (IF NOT EXISTS) until `python -m db.partitioning migrate`.
+            # untouched (IF NOT EXISTS) until `python -m db.migrate_partitions --yes`.
             """CREATE TABLE IF NOT EXISTS logs (
                 id          BIGSERIAL NOT NULL,
                 timestamp   TIMESTAMPTZ NOT NULL,
@@ -786,7 +786,7 @@ class Database:
                         if not vcur.fetchone():
                             logger.critical(
                                 "FATAL: 'logs' is partitioned but index 'idx_logs_id' is missing. "
-                                "Re-run `python -m db.partitioning migrate` to finish the migration.")
+                                "Re-run `python -m db.migrate_partitions --yes` to finish the migration.")
                             sys.exit(1)
                         vcur.execute("SELECT to_regclass('public.logs_default')")
                         row = vcur.fetchone()

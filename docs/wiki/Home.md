@@ -8,6 +8,7 @@ Welcome to the UniFi Log Insight wiki. These guides cover advanced topics beyond
 - [Configuration Reference](Configuration) — every environment variable, safe defaults, when to change what.
 - [MCP Server](MCP) — expose your network data to Claude Desktop / Claude Code / any MCP client, with the full tool catalog.
 - [Troubleshooting](Troubleshooting) — common failures with the exact log signature and the fix.
+- [Logs table partitioning](Logs-Partitioning) — move an existing install to daily partitions (retention by dropping whole days), and how to roll it back.
 - [External PostgreSQL Migration Guide](External-PostgreSQL-Migration-Guide) — Migrate from the embedded database to an external PostgreSQL server, with Docker networking guidance and a step-by-step walkthrough of the in-app migration wizard.
 - [Architecture](architecture) — how the three-process container fits together, data flow, DB schema highlights.
 
