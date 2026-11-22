@@ -182,6 +182,13 @@ class SyslogReceiver:
         self.last_flush = time.time()
         batch_len = len(to_insert)
 
+        # rDNS lookups enrich() deferred to the background may have finished
+        # since; never let this cost the batch.
+        try:
+            self.enricher.fill_pending_rdns(to_insert)
+        except Exception:
+            logger.debug("fill_pending_rdns failed; storing batch without late rDNS", exc_info=True)
+
         flush_start = time.time()
         try:
             self.db.insert_logs_batch(to_insert)

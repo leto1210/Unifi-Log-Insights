@@ -11,6 +11,7 @@ Enriches public IPs with:
 import os
 import json
 import math
+import queue
 import socket
 import ipaddress
 import logging
@@ -347,6 +348,8 @@ class AbuseIPDBEnricher:
     API_URL = 'https://api.abuseipdb.com/api/v2/check'
     STATS_FILE = '/tmp/abuseipdb_stats.json'
     MEMORY_CACHE_MAX_ENTRIES = 5000
+    MISS_CACHE_TTL_SECONDS = 300
+    MISS_CACHE_MAX_ENTRIES = 20000
 
     def __init__(self, api_key: str = None, db=None):
         """Initialise with an optional API key; if omitted reads ABUSEIPDB_API_KEY from env."""
@@ -355,6 +358,14 @@ class AbuseIPDBEnricher:
             ttl_seconds=DEFAULT_TTL_SECONDS,
             max_entries=self.MEMORY_CACHE_MAX_ENTRIES,
         )  # 24h in-memory hot cache
+        # Live-path misses (memory + DB both empty). Without it every packet
+        # from an unscored blocked IP repeats the ip_threats SELECT on the UDP
+        # receive thread. Short TTL bounds staleness when another process
+        # writes ip_threats; lookup() clears the entry when it scores the IP.
+        self._miss_cache = TTLCache(
+            ttl_seconds=self.MISS_CACHE_TTL_SECONDS,
+            max_entries=self.MISS_CACHE_MAX_ENTRIES,
+        )
         self.db = db  # Database instance for persistent threat cache
         self.enabled = self._resolve_enabled()
         self._lock = threading.Lock()
@@ -601,7 +612,13 @@ class AbuseIPDBEnricher:
         """
         if not self.enabled or ip_str in self._excluded_ips:
             return {}
-        return self._cache_get(ip_str) or {}
+        if self._miss_cache.get(ip_str) is not None:
+            return {}
+        cached = self._cache_get(ip_str)
+        if cached is None:
+            self._miss_cache.set(ip_str, True)
+            return {}
+        return cached
 
     def lookup(self, ip_str: str) -> dict:
         """Check an IP against AbuseIPDB. Returns threat_score and categories.
@@ -710,6 +727,7 @@ class AbuseIPDBEnricher:
 
             self._write_stats()
             self.cache.set(ip_str, result)
+            self._miss_cache.delete(ip_str)
             return result
 
         except requests.Timeout:
@@ -740,6 +758,7 @@ class RDNSEnricher:
     """
 
     MEMORY_CACHE_MAX_ENTRIES = 20000
+    RESOLVE_QUEUE_MAX = 1000
 
     POSITIVE_TTL_SECONDS = 86400            # 24h — successful resolution
     NEGATIVE_TTL_SECONDS = 7 * 86400        # 7d  — durable DNS-layer failure
@@ -766,6 +785,54 @@ class RDNSEnricher:
         )
         self._db = db
         self._db_failed = False  # one-shot WARNING de-duplication
+        # Background resolver for the live path (see submit()). Started lazily
+        # so processes that never call submit() (API, tests) spawn no thread.
+        self._queue = queue.Queue(maxsize=self.RESOLVE_QUEUE_MAX)
+        self._pending = set()
+        self._pending_lock = threading.Lock()
+        self._worker = None
+
+    def lookup_cached(self, ip_str: str) -> Optional[dict]:
+        """Hot-tier only: {'rdns': ...} if fresh in memory, else None. Never does I/O."""
+        entry = self.cache.get(ip_str)
+        if entry is not None and time.time() < entry.get('expires_at', 0):
+            return {'rdns': entry.get('rdns')}
+        return None
+
+    def submit(self, ip_str: str) -> None:
+        """Queue a full lookup() on the background resolver thread. Never blocks.
+
+        The live syslog path must not wait on the DB cold tier or a PTR query
+        (the resolver's own timeouts can exceed the 2 s socket default). When
+        the queue is full the IP is dropped; its next packet retries.
+        """
+        # ponytail: one resolver thread, since lookup() swaps the process-wide
+        # socket default timeout and parallel workers would race on restoring it.
+        # Pass the timeout per query (e.g. dnspython) if throughput ever matters.
+        with self._pending_lock:
+            if ip_str in self._pending:
+                return
+            try:
+                self._queue.put_nowait(ip_str)
+            except queue.Full:
+                return
+            self._pending.add(ip_str)
+            if self._worker is None:
+                self._worker = threading.Thread(
+                    target=self._resolve_loop, name='rdns-resolver', daemon=True)
+                self._worker.start()
+
+    def _resolve_loop(self):
+        """Drain the submit() queue forever, populating both cache tiers."""
+        while True:
+            ip_str = self._queue.get()
+            try:
+                self.lookup(ip_str)
+            except Exception:
+                logger.debug("Background rDNS lookup failed for %s", ip_str, exc_info=True)
+            finally:
+                with self._pending_lock:
+                    self._pending.discard(ip_str)
 
     def _db_get(self, ip_str: str) -> Optional[dict]:
         """Wrap DB read with fault-tolerance. Never raises."""
@@ -877,6 +944,8 @@ class Enricher:
     _COALESCE_TTL = 60.0
     # Max entries before lazy-pruning the coalescing map
     _COALESCE_MAP_MAX_SIZE = 256
+    # Row key marking a deferred rDNS lookup; not an INSERT column, popped at flush
+    RDNS_PENDING_KEY = '_rdns_pending_ip'
 
     def __init__(self, db=None, unifi=None):
         """Wire up GeoIP, AbuseIPDB, and rDNS enrichers; pre-load WAN exclusions from DB."""
@@ -912,6 +981,37 @@ class Enricher:
 
         # rDNS opt-out toggle: env > system_config > default(True)
         self._rdns_enabled = _resolve_rdns_enabled(db)
+
+        # vpn_networks for zone_index rule resolution. Read once here and on
+        # reload_config() (every vpn_networks write sends SIGUSR2) instead of
+        # one system_config SELECT per firewall packet.
+        self._vpn_networks = {}
+        self._load_vpn_networks()
+
+    def _load_vpn_networks(self):
+        """Refresh the cached vpn_networks config; keep the old value on DB errors."""
+        if not self._db:
+            return
+        try:
+            from db import get_config, parse_vpn_config
+            self._vpn_networks = parse_vpn_config(get_config(self._db, 'vpn_networks'))
+        except Exception:
+            logger.debug("Failed to load vpn_networks config", exc_info=True)
+
+    def fill_pending_rdns(self, rows: list[dict]) -> None:
+        """Late-bind rDNS on rows whose lookup was deferred by enrich().
+
+        Called just before a batch insert: background lookups that finished
+        since enrich() land in the row; the rest are stored without rdns.
+        """
+        # ponytail: misses not resolved by flush time stay NULL (no UPDATE on
+        # logs). Add a post-insert patch only if NULL rdns on first-seen IPs matters.
+        for row in rows:
+            ip_str = row.pop(self.RDNS_PENDING_KEY, None)
+            if ip_str:
+                hit = self.rdns.lookup_cached(ip_str)
+                if hit and hit.get('rdns'):
+                    row['rdns'] = hit['rdns']
 
     def _is_remote_ip(self, ip_str: str) -> bool:
         """Check if IP is remote (enrichable): public, not our WAN, not gateway."""
@@ -1013,13 +1113,11 @@ class Enricher:
                     rule_desc=parsed.get('rule_desc'),
                 )
                 if parsed_rule and parsed_rule['format'] == 'zone_index':
-                    from db import get_config, parse_vpn_config
-                    vpn_networks = parse_vpn_config(get_config(self._db, 'vpn_networks'))
                     action = resolve_rule_action(
                         parsed_rule, self.unifi,
                         interface_in=parsed.get('interface_in', ''),
                         interface_out=parsed.get('interface_out', ''),
-                        vpn_networks=vpn_networks,
+                        vpn_networks=self._vpn_networks,
                     )
                     if action:
                         parsed['rule_action'] = action
@@ -1050,9 +1148,14 @@ class Enricher:
             parsed.update(geo_data)
 
         # rDNS (skip for pihole — domain already in dns_query, or operator opt-out)
+        # Memory only on this (UDP receive) thread: a miss is resolved in the
+        # background and fill_pending_rdns() picks it up at batch flush.
         if not is_pihole and self._rdns_enabled:
-            rdns_data = self.rdns.lookup(ip_to_enrich)
-            if rdns_data.get('rdns'):
+            rdns_data = self.rdns.lookup_cached(ip_to_enrich)
+            if rdns_data is None:
+                self.rdns.submit(ip_to_enrich)
+                parsed[self.RDNS_PENDING_KEY] = ip_to_enrich
+            elif rdns_data.get('rdns'):
                 parsed['rdns'] = rdns_data['rdns']
 
         # AbuseIPDB (blocked firewall events, or pihole with threat enabled)
@@ -1108,6 +1211,7 @@ class Enricher:
                 logger.debug("Failed to reload pihole_enrichment config", exc_info=True)
         # rDNS toggle reload — env stays authoritative on reload as well.
         self._rdns_enabled = _resolve_rdns_enabled(self._db)
+        self._load_vpn_networks()
         # AbuseIPDB master toggle reload (kill-switch without removing the key).
         self.abuseipdb.reload_config()
 
