@@ -15,7 +15,8 @@ import sys
 import threading
 
 import parsers
-from db import Database, build_conn_params, get_config, is_external_db, set_config, wait_for_postgres
+from db import (Database, build_conn_params, get_config, is_external_db, partitioning,
+                set_config, wait_for_postgres)
 from enrichment import Enricher
 from backfill import BackfillTask
 from stats_rollup import StatsRollupTask
@@ -86,6 +87,14 @@ def main():
     # Initialize database
     db = Database(conn_params)
     db.connect()
+
+    # Partitioned logs: have today's and the coming week's partitions before
+    # receiving (rows would otherwise land in logs_default). No-op on a plain table.
+    try:
+        partitioning.ensure_partitions(db)
+    except Exception:
+        logger.warning("Partition maintenance at boot failed — scheduler retries hourly",
+                       exc_info=True)
 
     # Create performance indexes that require CONCURRENTLY (existing installs)
     db.ensure_post_boot_indexes()

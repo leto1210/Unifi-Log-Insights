@@ -38,6 +38,7 @@ from .retention import (
     parse_retention_days,
     parse_retention_time,
 )
+from . import partitioning
 from . import schema as _schema
 
 
@@ -121,8 +122,12 @@ class Database:
         """
         migrations = [
             # ── Base schema (matches init.sql) ────────────────────────────
+            # Fresh installs get a daily-partitioned table (see db/partitioning.py).
+            # No PRIMARY KEY: on a partitioned table it would have to include
+            # timestamp; idx_logs_id serves id lookups. Existing plain tables are
+            # untouched (IF NOT EXISTS) until `python -m db.partitioning migrate`.
             """CREATE TABLE IF NOT EXISTS logs (
-                id          BIGSERIAL PRIMARY KEY,
+                id          BIGSERIAL NOT NULL,
                 timestamp   TIMESTAMPTZ NOT NULL,
                 log_type    VARCHAR(20) NOT NULL,
                 direction   VARCHAR(20),
@@ -164,7 +169,21 @@ class Database:
                 remote_ip   INET,
                 raw_log     TEXT NOT NULL,
                 created_at  TIMESTAMPTZ DEFAULT NOW()
-            )""",
+            ) PARTITION BY RANGE (timestamp)""",
+            # Partitioned shape only (no-op on a plain table): the id index —
+            # built here only while the table has no partition yet, i.e. a fresh
+            # install where it is instant — and the DEFAULT catch-all partition.
+            """DO $$ BEGIN
+                IF (SELECT c.relkind FROM pg_class c
+                    JOIN pg_namespace n ON n.oid = c.relnamespace
+                    WHERE n.nspname = 'public' AND c.relname = 'logs') = 'p' THEN
+                    IF NOT EXISTS (SELECT 1 FROM pg_inherits
+                                   WHERE inhparent = 'public.logs'::regclass) THEN
+                        CREATE INDEX IF NOT EXISTS idx_logs_id ON logs (id);
+                    END IF;
+                    CREATE TABLE IF NOT EXISTS logs_default PARTITION OF logs DEFAULT;
+                END IF;
+            END $$""",
             # Performance indexes from init.sql
             "CREATE INDEX IF NOT EXISTS idx_logs_timestamp    ON logs (timestamp DESC)",
             "CREATE INDEX IF NOT EXISTS idx_logs_src_ip       ON logs (src_ip)",
@@ -575,12 +594,21 @@ class Database:
             # Lower thresholds ensure autovacuum fires promptly after batch
             # retention deletes. ALTER TABLE logs SET is idempotent: safe to
             # re-apply on every boot (no IF NOT EXISTS equivalent needed).
-            """ALTER TABLE logs SET (
-                autovacuum_vacuum_scale_factor  = 0.01,
-                autovacuum_vacuum_cost_delay    = 2,
-                autovacuum_analyze_scale_factor = 0.02,
-                autovacuum_vacuum_cost_limit    = 10000
-            )""",
+            # Plain table only: PostgreSQL rejects storage parameters on a
+            # partitioned parent, and an unguarded failure here aborts boot.
+            # Daily partitions only see edge DELETEs, so defaults suit them.
+            """DO $$ BEGIN
+                IF (SELECT c.relkind FROM pg_class c
+                    JOIN pg_namespace n ON n.oid = c.relnamespace
+                    WHERE n.nspname = 'public' AND c.relname = 'logs') = 'r' THEN
+                    ALTER TABLE logs SET (
+                        autovacuum_vacuum_scale_factor  = 0.01,
+                        autovacuum_vacuum_cost_delay    = 2,
+                        autovacuum_analyze_scale_factor = 0.02,
+                        autovacuum_vacuum_cost_limit    = 10000
+                    );
+                END IF;
+            END $$""",
             # Log autovacuum runs that exceed 60 s so operators can verify
             # the tuned scale_factor is firing after large retention cleanups.
             # Requires ALTER DATABASE privilege — skipped silently if missing.
@@ -749,6 +777,25 @@ class Database:
                             db_user, grant_hint
                         )
                         sys.exit(1)
+
+                    # Partitioned logs: id lookups need idx_logs_id, and rows
+                    # with no day partition need logs_default (else INSERTs fail).
+                    if partitioning.is_partitioned(vcur):
+                        vcur.execute("""SELECT 1 FROM pg_indexes
+                                       WHERE schemaname = 'public' AND indexname = 'idx_logs_id'""")
+                        if not vcur.fetchone():
+                            logger.critical(
+                                "FATAL: 'logs' is partitioned but index 'idx_logs_id' is missing. "
+                                "Re-run `python -m db.partitioning migrate` to finish the migration.")
+                            sys.exit(1)
+                        vcur.execute("SELECT to_regclass('public.logs_default')")
+                        row = vcur.fetchone()
+                        if not row or row[0] is None:
+                            logger.critical(
+                                "FATAL: 'logs' is partitioned but partition 'logs_default' is missing. "
+                                "The database user '%s' likely lacks CREATE TABLE privilege. %s",
+                                db_user, grant_hint)
+                            sys.exit(1)
             logger.info("Schema migrations applied and validated.")
         except SystemExit:
             raise
@@ -796,10 +843,27 @@ class Database:
                            exc_info=True)
             return
         try:
+            # CREATE/DROP INDEX CONCURRENTLY is impossible on a partitioned
+            # parent: those go through partitioning.create_index_online() /
+            # drop_index() instead. A failed shape check falls back to the
+            # plain-table path, whose errors are caught per index below.
+            try:
+                with conn.cursor() as cur:
+                    partitioned = partitioning.is_partitioned(cur)
+            except Exception:
+                partitioned = False
             for idx in self._POST_BOOT_INDEXES:
                 try:
                     when = idx.get('when')
-                    if when is not None and not self._index_condition_met(when, idx['name']):
+                    unwanted = when is not None and not self._index_condition_met(when, idx['name'])
+                    if partitioned:
+                        if unwanted:
+                            partitioning.drop_index(conn, idx['name'])
+                        else:
+                            # Idempotent and resumable: finishes a half-attached index.
+                            partitioning.create_index_online(conn, idx['name'], idx['def'])
+                        continue
+                    if unwanted:
                         # Condition not met on this install — index unwanted.
                         # Drop it if present so a config change (e.g. UniFi
                         # enabled) reclaims its space + per-INSERT write cost.
@@ -847,6 +911,11 @@ class Database:
                 return
             for name, sql in self._POST_BOOT_DROPS:
                 try:
+                    if partitioned:
+                        # Partitioned index: CONCURRENTLY is refused; plain DROP
+                        # under a 5 s lock_timeout instead.
+                        partitioning.drop_index(conn, name)
+                        continue
                     with conn.cursor() as cur:
                         logger.info("Dropping redundant index %s...", name)
                         cur.execute(sql)
@@ -1260,6 +1329,10 @@ class Database:
             non_dns_deleted, deleted_so_far, batches_completed, capped, error.
             ``capped`` is True when the per-pass delete cap stopped the run
             early; the remainder is deleted by the next pass.
+            ``partitions_dropped`` lists the whole day partitions (and
+            logs_legacy) dropped first when logs is partitioned; the batched
+            DELETE then only handles DNS retention, the partition straddling
+            the cutoff, logs_default and logs_legacy until it is dropped.
         """
         from datetime import datetime, timezone, timedelta
 
@@ -1280,8 +1353,17 @@ class Database:
             'deleted_so_far': 0,
             'batches_completed': 0,
             'capped': False,
+            'partitions_dropped': [],
             'error': None,
         }
+
+        # Partitioned logs: dropping a fully expired day costs no dead tuples.
+        # Best effort — the DELETE passes below still enforce retention.
+        try:
+            result['partitions_dropped'] = partitioning.drop_expired_partitions(
+                self, now - timedelta(days=general_days))
+        except Exception as exc:
+            logger.warning("Retention partition drop failed, falling back to DELETE: %s", exc)
 
         try:
             for label, type_filter, cutoff in passes:
@@ -1438,14 +1520,9 @@ class Database:
                 # every STATS_INTERVAL_MINUTES — can starve I/O and exhaust the
                 # connection pool. reltuples is maintained by autovacuum and is
                 # accurate to ~1% on active tables, which is more than enough
-                # for a logged/debug total. Mirrors the /api/health endpoint.
-                cur.execute("""
-                    SELECT COALESCE(GREATEST(c.reltuples::bigint, 0), 0)
-                    FROM pg_class c
-                    JOIN pg_namespace n ON n.oid = c.relnamespace
-                    WHERE c.relname = 'logs'
-                      AND n.nspname = 'public'
-                """)
+                # for a logged/debug total. Mirrors the /api/health endpoint;
+                # summed over leaf partitions when logs is partitioned.
+                cur.execute(partitioning.LOGS_ROW_ESTIMATE_SQL)
                 row = cur.fetchone()
                 total = row[0] if row else 0
                 cur.execute(

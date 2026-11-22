@@ -7,7 +7,7 @@ import time
 import schedule
 
 import stats_rollup
-from db import Database
+from db import Database, partitioning
 from enrichment import Enricher
 from blacklist import BlacklistFetcher
 from routes.auth import auth_cleanup
@@ -23,8 +23,17 @@ logger = logging.getLogger('receiver')
 _retention_reload_requested = threading.Event()
 
 
+def _ensure_partitions(db: Database):
+    """Create upcoming day partitions of logs (no-op on a plain table)."""
+    try:
+        partitioning.ensure_partitions(db)
+    except Exception as e:
+        logger.warning("Partition maintenance failed (will retry): %s", e)
+
+
 def _retention_cleanup(db: Database):
     """Run a full retention cleanup pass. Called by the schedule library."""
+    _ensure_partitions(db)
     try:
         cfg = Database.resolve_retention_days(db)
         logger.info("Retention cleanup starting (general_retention=%d days, dns_retention=%d days)",
@@ -112,6 +121,8 @@ def run_scheduler(db: Database, enricher: Enricher, blacklist_fetcher: Blacklist
 
     schedule.every(STATS_INTERVAL_MINUTES).minutes.do(log_stats)
     schedule.every(WAN_REFRESH_INTERVAL_MINUTES).minutes.do(refresh_wan_ip)
+    # Day partitions are created a week ahead; hourly retries cover lock timeouts.
+    schedule.every().hour.do(_ensure_partitions, db=db)
     _register_retention_job(db)
     schedule.every().day.at("04:00").do(pull_blacklist)
     # auth_cleanup has its own internal try/except — no wrapper needed here.
