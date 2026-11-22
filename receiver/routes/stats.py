@@ -19,6 +19,7 @@ from query_helpers import (parse_time_range, build_log_query, validate_time_para
                           device_name_device_lateral, device_name_coalesce,
                           sanitize_csv_cell)
 from routes._response_cache import ttl_cache
+import stats_rollup
 
 # Dashboard stats — each first-page-load request runs 4-10 aggregations over
 # the multi-million-row `logs` table. Cache for 30 s so repeated loads /
@@ -317,6 +318,64 @@ def _query_traffic_by_action(cur, cutoff, bucket):
     return sorted(action_map.values(), key=lambda x: x['period'])
 
 
+# Filters shared by the raw and rollup paths of the top countries/services tables.
+_COUNTRIES_WHERE = ("rule_action IN ('block', 'allow') AND geo_country IS NOT NULL "
+                    "AND (rule_action = 'block' OR direction = 'outbound')")
+_SERVICES_WHERE = "rule_action IN ('block', 'allow') AND service_name IS NOT NULL"
+
+
+def _top_by_action(rows, key):
+    """Split (value, rule_action, count) rows into top-10 blocked and allowed lists."""
+    def top(action_is_block):
+        """Top 10 entries for one side, highest count first."""
+        entries = [{key: value, 'count': n} for value, action, n in rows
+                   if (action == 'block') == action_is_block]
+        return sorted(entries, key=lambda x: -x['count'])[:10]
+    return top(True), top(False)
+
+
+def _desc(counts_by_key):
+    """{key: count} ordered by count descending, zero counts dropped."""
+    return dict(sorted(((k, n) for k, n in counts_by_key.items() if n),
+                       key=lambda kv: kv[1], reverse=True))
+
+
+def _overview_from_rollup(cur, cutoff, span):
+    """total/allowed/blocked/by_direction/by_type from the hourly rollup (no threats)."""
+    total = allowed = blocked = 0
+    by_type, by_direction = {}, {}
+    for (log_type, action, direction), n in stats_rollup.counts(
+            cur, cutoff, span,
+            [('log_type', 'log_type'), ('rule_action', 'rule_action'), ('direction', 'direction')]).items():
+        total += n
+        by_type[log_type] = by_type.get(log_type, 0) + n
+        if action == 'block':
+            blocked += n
+        if log_type == 'firewall' and action == 'allow':
+            allowed += n
+        if direction is not None:
+            by_direction[direction] = by_direction.get(direction, 0) + n
+    return {'total': total, 'allowed': allowed, 'blocked': blocked,
+            'by_direction': _desc(by_direction), 'by_type': _desc(by_type)}
+
+
+def _charts_from_rollup(cur, cutoff, span, bucket):
+    """(logs_over_time, traffic_by_action) from the hourly rollup, same shape as the raw queries."""
+    per_period, action_map = {}, {}  # keyed by datetime: sorting ISO strings breaks across DST
+    for (period, log_type, action), n in stats_rollup.counts(
+            cur, cutoff, span,
+            [('period', f"date_trunc('{bucket}', {{ts}})"),
+             ('log_type', 'log_type'), ('rule_action', 'rule_action')]).items():
+        per_period[period] = per_period.get(period, 0) + n
+        if log_type == 'firewall' and action is not None:
+            entry = action_map.setdefault(
+                period, {'period': period.isoformat(), 'allow': 0, 'block': 0, 'redirect': 0})
+            if action in entry:
+                entry[action] += n
+    logs_over_time = [{'period': p.isoformat(), 'count': per_period[p]} for p in sorted(per_period)]
+    return logs_over_time, [action_map[p] for p in sorted(action_map)]
+
+
 # TODO: Optimise /api/stats for dashboard load time.
 #   - Option 1: Parallelise the ~12 sequential SQL queries (e.g. asyncio.gather or threaded cursor)
 #   - Option 2: Have the dashboard call /api/stats/overview first to render summary cards instantly,
@@ -476,35 +535,43 @@ def get_stats_overview(
     conn = get_conn()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("""
-                SELECT
-                    COUNT(*) AS total,
-                    COUNT(*) FILTER (WHERE log_type = 'firewall' AND rule_action = 'allow') AS allowed,
-                    COUNT(*) FILTER (WHERE rule_action = 'block') AS blocked,
-                    COUNT(*) FILTER (WHERE threat_score > 50) AS threats
-                FROM logs WHERE timestamp >= %s
-            """, [cutoff])
-            row = cur.fetchone()
+            span = stats_rollup.plan(cur, cutoff, datetime.now(timezone.utc))
+            if span:
+                overview = _overview_from_rollup(cur, cutoff, span)
+                # threat_score is backfilled late, so it is never rolled up
+                cur.execute("SELECT COUNT(*) AS threats FROM logs "
+                            "WHERE timestamp >= %s AND threat_score > 50", [cutoff])
+                overview['threats'] = cur.fetchone()['threats']
+            else:
+                cur.execute("""
+                    SELECT
+                        COUNT(*) AS total,
+                        COUNT(*) FILTER (WHERE log_type = 'firewall' AND rule_action = 'allow') AS allowed,
+                        COUNT(*) FILTER (WHERE rule_action = 'block') AS blocked,
+                        COUNT(*) FILTER (WHERE threat_score > 50) AS threats
+                    FROM logs WHERE timestamp >= %s
+                """, [cutoff])
+                overview = dict(cur.fetchone())
 
-            cur.execute("""
-                SELECT direction, COUNT(*) AS count
-                FROM logs
-                WHERE timestamp >= %s AND direction IS NOT NULL
-                GROUP BY direction ORDER BY count DESC
-            """, [cutoff])
-            by_direction = {r['direction']: r['count'] for r in cur.fetchall()}
+                cur.execute("""
+                    SELECT direction, COUNT(*) AS count
+                    FROM logs
+                    WHERE timestamp >= %s AND direction IS NOT NULL
+                    GROUP BY direction ORDER BY count DESC
+                """, [cutoff])
+                overview['by_direction'] = {r['direction']: r['count'] for r in cur.fetchall()}
 
-            by_type = _query_by_type(cur, cutoff)
+                overview['by_type'] = _query_by_type(cur, cutoff)
 
         conn.commit()
         return {
             'time_range': time_range,
-            'total': row['total'],
-            'allowed': row['allowed'],
-            'blocked': row['blocked'],
-            'threats': row['threats'],
-            'by_direction': by_direction,
-            'by_type': by_type,
+            'total': overview['total'],
+            'allowed': overview['allowed'],
+            'blocked': overview['blocked'],
+            'threats': overview['threats'],
+            'by_direction': overview['by_direction'],
+            'by_type': overview['by_type'],
         }
     except Exception as e:
         conn.rollback()
@@ -530,44 +597,37 @@ def get_stats_tables(
             # --- WAN IP exclusion (shared across multiple queries) ---
             exclude_ips = _build_exclude_ips()
 
-            # --- Consolidated countries query (blocked + allowed) ---
-            cur.execute(
-                "SELECT geo_country AS country, rule_action, COUNT(*) AS count FROM logs "
-                "WHERE timestamp >= %s AND rule_action IN ('block', 'allow') "
-                "AND geo_country IS NOT NULL "
-                "AND (rule_action = 'block' OR direction = 'outbound') "
-                "GROUP BY geo_country, rule_action ORDER BY count DESC",
-                [cutoff]
-            )
-            blocked_countries_map = {}
-            allowed_countries_map = {}
-            for r in cur.fetchall():
-                entry = {'country': r['country'], 'count': r['count']}
-                if r['rule_action'] == 'block':
-                    blocked_countries_map[r['country']] = entry
-                else:
-                    allowed_countries_map[r['country']] = entry
-            top_blocked_countries = sorted(blocked_countries_map.values(), key=lambda x: -x['count'])[:10]
-            top_allowed_countries = sorted(allowed_countries_map.values(), key=lambda x: -x['count'])[:10]
+            span = stats_rollup.plan(cur, cutoff, datetime.now(timezone.utc))
+            if span:
+                country_rows = [
+                    (country, action, n) for (country, action), n in stats_rollup.counts(
+                        cur, cutoff, span, [('country', 'geo_country'), ('rule_action', 'rule_action')],
+                        _COUNTRIES_WHERE, dim=stats_rollup.DIM_COUNTRY).items()]
+                service_rows = [
+                    (service, action, n) for (service, action), n in stats_rollup.counts(
+                        cur, cutoff, span, [('service_name', 'service_name'), ('rule_action', 'rule_action')],
+                        _SERVICES_WHERE, dim=stats_rollup.DIM_SERVICE).items()]
+            else:
+                # --- Consolidated countries query (blocked + allowed) ---
+                cur.execute(
+                    "SELECT geo_country AS country, rule_action, COUNT(*) AS count FROM logs "
+                    f"WHERE timestamp >= %s AND {_COUNTRIES_WHERE} "
+                    "GROUP BY geo_country, rule_action ORDER BY count DESC",
+                    [cutoff]
+                )
+                country_rows = [(r['country'], r['rule_action'], r['count']) for r in cur.fetchall()]
 
-            # --- Consolidated services query (blocked + allowed) ---
-            cur.execute(
-                "SELECT service_name, rule_action, COUNT(*) AS count FROM logs "
-                "WHERE timestamp >= %s AND rule_action IN ('block', 'allow') "
-                "AND service_name IS NOT NULL "
-                "GROUP BY service_name, rule_action ORDER BY count DESC",
-                [cutoff]
-            )
-            blocked_services_map = {}
-            allowed_services_map = {}
-            for r in cur.fetchall():
-                entry = {'service_name': r['service_name'], 'count': r['count']}
-                if r['rule_action'] == 'block':
-                    blocked_services_map[r['service_name']] = entry
-                else:
-                    allowed_services_map[r['service_name']] = entry
-            top_blocked_services = sorted(blocked_services_map.values(), key=lambda x: -x['count'])[:10]
-            top_allowed_services = sorted(allowed_services_map.values(), key=lambda x: -x['count'])[:10]
+                # --- Consolidated services query (blocked + allowed) ---
+                cur.execute(
+                    "SELECT service_name, rule_action, COUNT(*) AS count FROM logs "
+                    f"WHERE timestamp >= %s AND {_SERVICES_WHERE} "
+                    "GROUP BY service_name, rule_action ORDER BY count DESC",
+                    [cutoff]
+                )
+                service_rows = [(r['service_name'], r['rule_action'], r['count']) for r in cur.fetchall()]
+
+            top_blocked_countries, top_allowed_countries = _top_by_action(country_rows, 'country')
+            top_blocked_services, top_allowed_services = _top_by_action(service_rows, 'service_name')
 
             top_blocked_ips = _query_top_blocked_ips(cur, cutoff, exclude_ips)
             top_blocked_internal_ips = _query_top_blocked_internal_ips(cur, cutoff)
@@ -614,8 +674,12 @@ def get_stats_charts(
     conn = get_conn()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            logs_over_time = _query_logs_over_time(cur, cutoff, bucket)
-            traffic_by_action = _query_traffic_by_action(cur, cutoff, bucket)
+            span = stats_rollup.plan(cur, cutoff, datetime.now(timezone.utc))
+            if span:
+                logs_over_time, traffic_by_action = _charts_from_rollup(cur, cutoff, span, bucket)
+            else:
+                logs_over_time = _query_logs_over_time(cur, cutoff, bucket)
+                traffic_by_action = _query_traffic_by_action(cur, cutoff, bucket)
 
         conn.commit()
         return {

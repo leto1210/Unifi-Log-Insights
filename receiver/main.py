@@ -18,6 +18,7 @@ import parsers
 from db import Database, build_conn_params, get_config, is_external_db, set_config, wait_for_postgres
 from enrichment import Enricher
 from backfill import BackfillTask
+from stats_rollup import StatsRollupTask
 from blacklist import BlacklistFetcher
 from unifi_api import UniFiAPI
 from pihole_api import PiHolePoller
@@ -157,6 +158,9 @@ def main():
     # Start backfill daemon (queue-driven threat enrichment every 5 min)
     backfill = BackfillTask(db, enricher)
     backfill.start()
+
+    # Keep the dashboard's hourly rollup fresh and backfill its history
+    StatsRollupTask(db, lambda: Database.resolve_retention_days(db).general).start()
 
     # Start UniFi client/device polling (only runs if enabled)
     unifi_api.start_polling()

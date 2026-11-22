@@ -6,6 +6,7 @@ import time
 
 import schedule
 
+import stats_rollup
 from db import Database
 from enrichment import Enricher
 from blacklist import BlacklistFetcher
@@ -36,6 +37,13 @@ def _retention_cleanup(db: Database):
             logger.error("Retention cleanup failed: %s", result['error'])
     except Exception as e:
         logger.error("Retention cleanup failed: %s", e)
+
+    # Dashboard rollup follows the same general/DNS retention as logs.
+    try:
+        cfg = Database.resolve_retention_days(db)
+        stats_rollup.purge(db, cfg.general, cfg.dns)
+    except Exception as e:
+        logger.warning("Stats rollup retention purge failed: %s", e)
 
     # rdns_cache sweep — independent pass so a failure here is not misreported
     # as log-retention failure.

@@ -23,6 +23,14 @@ def _clear_stats_response_cache():
         pass
 
 
+@pytest.fixture(autouse=True)
+def _raw_path_only(monkeypatch):
+    """These tests script the raw-query cursor sequence; keep the hourly rollup
+    out of it (its path is covered in test_stats_rollup.py)."""
+    import stats_rollup
+    monkeypatch.setattr(stats_rollup, 'plan', lambda *_a, **_k: None)
+
+
 @pytest.fixture
 def client(monkeypatch):
     """Create a FastAPI TestClient with mocked deps module."""
@@ -107,7 +115,9 @@ def _mock_cursor_results(mock_deps, results_sequence):
 
 
 class TestStatsOverview:
+    """/api/stats/overview on the raw-query path."""
     def test_overview_returns_expected_keys(self, client):
+        """Overview returns every counter and breakdown key."""
         test_client, mock_deps, _ = client
 
         # overview runs: 1) scalar counts (fetchone), 2) by_direction (fetchall), 3) by_type (fetchall)
@@ -129,6 +139,7 @@ class TestStatsOverview:
         assert data['time_range'] == '24h'
 
     def test_overview_default_time_range(self, client):
+        """Overview defaults to the 24h range."""
         test_client, mock_deps, _ = client
         _mock_cursor_results(mock_deps, [
             {'total': 0, 'allowed': 0, 'blocked': 0, 'threats': 0},
@@ -141,6 +152,7 @@ class TestStatsOverview:
         assert resp.json()['time_range'] == '24h'
 
     def test_overview_db_failure(self, client):
+        """A DB error surfaces as a 500."""
         test_client, mock_deps, _ = client
 
         mock_conn = MagicMock()
@@ -156,7 +168,9 @@ class TestStatsOverview:
 
 
 class TestStatsCharts:
+    """/api/stats/charts on the raw-query path."""
     def test_charts_returns_expected_keys(self, client):
+        """Charts return both series plus the legacy alias."""
         test_client, mock_deps, _ = client
 
         ts = datetime(2026, 3, 20, 12, 0, 0, tzinfo=timezone.utc)
@@ -180,6 +194,7 @@ class TestStatsCharts:
         assert data['traffic_by_action'][0]['block'] == 20
 
     def test_charts_db_failure(self, client):
+        """A DB error surfaces as a 500."""
         test_client, mock_deps, _ = client
 
         mock_conn = MagicMock()
@@ -195,7 +210,9 @@ class TestStatsCharts:
 
 
 class TestStatsTables:
+    """/api/stats/tables on the raw-query path."""
     def test_tables_returns_expected_keys(self, client):
+        """Tables return every top-N list."""
         test_client, mock_deps, _ = client
 
         # tables runs many queries — we need to provide results for each fetchall
@@ -273,6 +290,7 @@ class TestStatsTables:
         assert data['top_dns'] == []
 
     def test_tables_db_failure(self, client):
+        """A DB error surfaces as a 500."""
         test_client, mock_deps, _ = client
 
         mock_conn = MagicMock()

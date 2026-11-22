@@ -527,6 +527,23 @@ class Database:
             )""",
             """CREATE INDEX IF NOT EXISTS idx_rdns_cache_looked_up_at
                 ON rdns_cache (looked_up_at)""",
+            # ── Dashboard hourly rollup (see stats_rollup.py) ─────────────
+            # New, small tables: plain CREATE INDEX is instant here.
+            """CREATE TABLE IF NOT EXISTS logs_hourly_stats (
+                hour         TIMESTAMPTZ NOT NULL,
+                dim          SMALLINT NOT NULL,
+                log_type     VARCHAR(20),
+                rule_action  VARCHAR(20),
+                direction    VARCHAR(20),
+                geo_country  VARCHAR(2),
+                service_name TEXT,
+                count        BIGINT NOT NULL
+            )""",
+            "CREATE INDEX IF NOT EXISTS idx_logs_hourly_stats_hour_dim ON logs_hourly_stats (hour, dim)",
+            """CREATE TABLE IF NOT EXISTS logs_hourly_stats_hours (
+                hour        TIMESTAMPTZ PRIMARY KEY,
+                computed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )""",
             # ── AdGuard Home integration ──────────────────────────────────────
             # adguard_logs is always a new table, so index builds are instantaneous
             # — ACCESS EXCLUSIVE lock risk is zero. Non-concurrent CREATE INDEX is
