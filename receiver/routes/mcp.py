@@ -489,7 +489,7 @@ def _tool_get_log(args: dict) -> dict:
 
 def _tool_get_top_threat_ips(args: dict) -> dict:
     """MCP tool: return the top threat IPs from the stats endpoint."""
-    stats = stats_routes.get_stats(time_range=args.get('time_range', '24h'))
+    stats = stats_routes.get_stats_tables(time_range=args.get('time_range', '24h'))
     return {'top_threat_ips': stats.get('top_threat_ips', [])}
 
 

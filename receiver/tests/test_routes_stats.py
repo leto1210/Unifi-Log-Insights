@@ -318,3 +318,25 @@ def test_query_by_type_sorts_desc_and_drops_zero_counts():
     ]
     result = _query_by_type(cur, datetime.now(timezone.utc))
     assert list(result.items()) == [('firewall', 90), ('dhcp', 5)]
+
+
+def test_get_stats_is_union_of_split_endpoints(client, monkeypatch):
+    """/api/stats (MCP get_log_stats) delegates to overview/tables/charts so it rides
+    their rollup path instead of re-counting raw logs (timed out on 7d+ in prod)."""
+    _test_client, _deps, _db = client
+    import routes.stats as stats
+    calls = []
+
+    def fake(name, payload):
+        def handler(time_range):
+            calls.append((name, time_range))
+            return payload
+        return handler
+
+    monkeypatch.setattr(stats, 'get_stats_overview', fake('overview', {'time_range': '7d', 'total': 3}))
+    monkeypatch.setattr(stats, 'get_stats_tables', fake('tables', {'top_threat_ips': []}))
+    monkeypatch.setattr(stats, 'get_stats_charts', fake('charts', {'logs_over_time': []}))
+
+    assert stats.get_stats(time_range='7d') == {
+        'time_range': '7d', 'total': 3, 'top_threat_ips': [], 'logs_over_time': []}
+    assert calls == [('overview', '7d'), ('tables', '7d'), ('charts', '7d')]

@@ -122,6 +122,16 @@ CREATE INDEX IF NOT EXISTS idx_logs_nondns_timestamp
     ON logs (timestamp DESC)
     WHERE log_type != 'dns';
 
+-- Covering partial indexes: index-only scans for the dashboard per-IP tops
+-- (blocked IPs, threat count + threat IPs). See db/schema.py POST_BOOT_INDEXES.
+CREATE INDEX IF NOT EXISTS idx_logs_block_src_cover
+    ON logs (timestamp DESC) INCLUDE (src_ip, geo_country, asn_name, threat_score)
+    WHERE rule_action = 'block';
+CREATE INDEX IF NOT EXISTS idx_logs_threat_cover
+    ON logs (timestamp DESC)
+    INCLUDE (src_ip, threat_score, geo_country, geo_city, asn_name, rdns, threat_categories)
+    WHERE threat_score > 50;
+
 -- Aggressive autovacuum for the high-churn logs table.
 -- Default scale_factor=0.2 means autovacuum waits until 20% of rows are dead
 -- before reclaiming space. On a large table that threshold is never reached

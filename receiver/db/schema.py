@@ -52,6 +52,21 @@ POST_BOOT_INDEXES = [
     _post_boot_index('idx_logs_type_id', "(log_type, id)", 'type+id for purge batches'),
     _post_boot_index('idx_logs_nondns_timestamp', "(timestamp DESC) WHERE log_type != 'dns'",
                      'non-DNS retention cleanup'),
+    # Covering partial indexes for the dashboard per-IP tops (routes/stats.py).
+    # (rule_action, timestamp) finds the rows fast, but each one is a random
+    # heap fetch: on a ~100 GB table the 7d/30d tops blew the 30 s
+    # statement_timeout. INCLUDE every column those queries read so they run
+    # as index-only scans. Partial, so only the small block / threat slices
+    # (~7 % / <1 % of rows) pay the per-INSERT cost; the allow side (~93 %)
+    # would be table-sized and is left to the rollup.
+    _post_boot_index('idx_logs_block_src_cover',
+                     "(timestamp DESC) INCLUDE (src_ip, geo_country, asn_name, threat_score) "
+                     "WHERE rule_action = 'block'",
+                     'index-only top blocked IPs'),
+    _post_boot_index('idx_logs_threat_cover',
+                     "(timestamp DESC) INCLUDE (src_ip, threat_score, geo_country, geo_city, "
+                     "asn_name, rdns, threat_categories) WHERE threat_score > 50",
+                     'index-only threat count + top threat IPs'),
 ]
 
 # Redundant / unused indexes dropped on upgrade. DROP CONCURRENTLY IF EXISTS

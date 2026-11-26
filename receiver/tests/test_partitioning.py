@@ -129,7 +129,8 @@ def test_fresh_install_is_partitioned_and_boot_is_idempotent(fresh_db, caplog):
     for _ in range(2):
         assert _boot_warnings(caplog, db._ensure_schema) == []
         assert _boot_warnings(caplog, db.ensure_post_boot_indexes) == []
-    for name in ('idx_logs_type_id', 'idx_logs_nondns_timestamp', 'idx_logs_spgist_dst_ip_firewall'):
+    for name in ('idx_logs_type_id', 'idx_logs_nondns_timestamp', 'idx_logs_spgist_dst_ip_firewall',
+                 'idx_logs_block_src_cover', 'idx_logs_threat_cover'):
         assert _index_valid(raw, name) is True, name
     assert _index_valid(raw, 'idx_logs_direction') is None  # POST_BOOT_DROPS applied
 
