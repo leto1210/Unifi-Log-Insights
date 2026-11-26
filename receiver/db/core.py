@@ -883,11 +883,21 @@ class Database:
                         continue
                     with conn.cursor() as cur:
                         cur.execute(
-                            "SELECT 1 FROM pg_indexes WHERE indexname = %s",
+                            "SELECT x.indisvalid FROM pg_index x "
+                            "JOIN pg_class c ON c.oid = x.indexrelid WHERE c.relname = %s",
                             (idx['name'],),
                         )
-                        if cur.fetchone():
-                            continue  # already exists
+                        row = cur.fetchone()
+                        if row and row[0]:
+                            continue  # already exists and valid
+                        if row:
+                            # An interrupted CONCURRENTLY build leaves an INVALID
+                            # index that IF NOT EXISTS would keep forever.
+                            logger.warning("Rebuilding invalid index %s", idx['name'])
+                            cur.execute("SET lock_timeout = '60s'")
+                            cur.execute(f"DROP INDEX CONCURRENTLY IF EXISTS {idx['name']}")
+                            # The rebuild waits out old transactions: keep it unbounded.
+                            cur.execute("RESET lock_timeout")
                         logger.info("Creating %s concurrently (%s)...",
                                     idx['name'], idx['label'])
                         cur.execute(idx['sql'])

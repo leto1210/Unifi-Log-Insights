@@ -276,10 +276,35 @@ def test_ensure_post_boot_indexes_skips_if_exists(monkeypatch):
 
     database.ensure_post_boot_indexes()
 
-    # Should query pg_indexes but NOT run CREATE INDEX
-    assert any('pg_indexes' in str(c) for c in mock_cursor.execute.call_args_list)
+    # Should check index validity but NOT run CREATE INDEX
+    assert any('indisvalid' in str(c) for c in mock_cursor.execute.call_args_list)
     executed_sql = ' '.join(str(c) for c in mock_cursor.execute.call_args_list)
     assert 'CREATE INDEX' not in executed_sql
+
+
+def test_ensure_post_boot_indexes_rebuilds_invalid_index(monkeypatch):
+    """An INVALID index (interrupted CONCURRENTLY build) is dropped and rebuilt,
+    not mistaken for a finished one."""
+    mock_conn = MagicMock()
+    mock_cursor = MagicMock()
+    mock_cursor.fetchone.return_value = (False,)  # present but indisvalid = false
+    mock_cursor.__enter__ = lambda s: s
+    mock_cursor.__exit__ = MagicMock(return_value=False)
+    mock_conn.cursor.return_value = mock_cursor
+
+    database = Database(conn_params={'user': 'unifi'})
+    database.get_config = MagicMock(return_value=False)
+    monkeypatch.setattr('db.psycopg2.connect', lambda **kw: mock_conn)
+
+    database.ensure_post_boot_indexes()
+
+    executed = [str(c) for c in mock_cursor.execute.call_args_list]
+    drop = next(i for i, c in enumerate(executed)
+                if 'DROP INDEX CONCURRENTLY IF EXISTS idx_logs_block_src_cover' in c)
+    create = next(i for i, c in enumerate(executed)
+                  if 'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_logs_block_src_cover' in c)
+    assert drop < create
+    assert 'RESET lock_timeout' in executed[create - 1]
 
 
 def test_ensure_post_boot_indexes_creates_when_missing(monkeypatch):
@@ -420,6 +445,8 @@ def test_post_boot_index_list_has_expected_entries():
     assert 'idx_logs_spgist_dst_ip_firewall' in names
     assert 'idx_logs_type_id' in names
     assert 'idx_logs_nondns_timestamp' in names
+    assert 'idx_logs_block_src_cover' in names
+    assert 'idx_logs_threat_cover' in names
 
 
 def test_post_boot_indexes_all_use_concurrently():
