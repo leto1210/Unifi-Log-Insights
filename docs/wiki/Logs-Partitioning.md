@@ -48,10 +48,40 @@ Run it when nobody is opening 7-day or 30-day dashboards, because the swap needs
 | 1. cutover | Picks and stores the cutover date | No |
 | 2. twin index | `CREATE INDEX CONCURRENTLY idx_logs_id_legacy ON logs (id)` (minutes on a large table) | No |
 | 3. bound | Adds `CHECK (timestamp < cutover)` and validates it (one full read of the table) | No |
-| 4. swap | One short transaction: new partitioned `logs`, the old table attached as `logs_legacy`, `logs_default`, the first day partitions | A fraction of a second; retried up to 10 times if a long query holds the table |
+| 4. swap | One short transaction: new partitioned `logs`, the old table attached as `logs_legacy`, `logs_default`, the first day partitions | Briefly: a fraction of a second on a small table, several seconds on a very large one (see the example below); retried up to 10 times if a long query holds the table |
 | 5. analyze | `ANALYZE logs` | No |
 
 The command can be interrupted and re-run: it resumes where it stopped. Until the cutover date, new rows still go into `logs_legacy`; after it, they go into the day partitions.
+
+On a large table the run lasts well over half an hour. To keep it going if your terminal or SSH session drops, start it detached and follow its output:
+
+```bash
+docker exec -d unifi-log-insight sh -c "python -m db.migrate_partitions --yes > /tmp/migrate_partitions.log 2>&1; echo EXIT=\$? >> /tmp/migrate_partitions.log"
+docker exec unifi-log-insight cat /tmp/migrate_partitions.log
+```
+
+A container restart stops it. Run the same command again and it resumes.
+
+#### Example: a 109 million row install
+
+This is a real run, on PostgreSQL 16 on a separate host with 30 GB of RAM. The `logs` table held about 109 million rows (~100 GB with its 16 indexes), and logs kept arriving at roughly 100,000 rows per hour throughout.
+
+| Phase | Time |
+|---|---|
+| 1. cutover | instant (cutover set about 50 h ahead) |
+| 2. twin index (~2.5 GiB) | 21 min 39 s |
+| 3. bound (full read of the table) | 9 min 53 s |
+| 4. swap | 13.2 s, on the first attempt |
+| 5. analyze | 3 min 12 s |
+| **Total** | **about 35 minutes** |
+
+What it meant for ingestion:
+
+- No rows were rejected and no insert failed.
+- Phases 2 and 3 load the disk. A few batch writes took up to 5 s, against well under 1 s normally.
+- During the swap, inserts waited for the lock. One batch write took 12.5 s, and the rows received that minute fell to about half the usual count. Syslog is UDP, so some messages sent during those seconds were probably lost.
+
+Scale your own estimate from your row count (shown by `--dry-run`): phases 2, 3 and 5 grow roughly with the table size.
 
 ### 3. Afterwards
 
