@@ -376,147 +376,21 @@ def _charts_from_rollup(cur, cutoff, span, bucket):
     return logs_over_time, [action_map[p] for p in sorted(action_map)]
 
 
-# TODO: Optimise /api/stats for dashboard load time.
-#   - Option 1: Parallelise the ~12 sequential SQL queries (e.g. asyncio.gather or threaded cursor)
-#   - Option 2: Have the dashboard call /api/stats/overview first to render summary cards instantly,
-#     then backfill the rest from /api/stats asynchronously (lazy-load sections)
 @router.get("/api/stats")
-@ttl_cache(_STATS_TTL_SECS)
 def get_stats(
     time_range: str = Query("24h", description="1h,6h,24h,7d,30d,60d"),
 ):
-    """Return aggregated dashboard stats: counts, top IPs, service breakdown, and trends."""
-    cutoff = parse_time_range(time_range)
-    if not cutoff:
-        cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
+    """Return aggregated dashboard stats: counts, top IPs, service breakdown, and trends.
 
-    bucket = _get_bucket(time_range)
-
-    conn = get_conn()
-    try:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            # Total logs
-            cur.execute("SELECT COUNT(*) as total FROM logs WHERE timestamp >= %s", [cutoff])
-            total = cur.fetchone()['total']
-
-            # By type
-            by_type = _query_by_type(cur, cutoff)
-
-            # Blocked count
-            cur.execute(
-                "SELECT COUNT(*) as count FROM logs "
-                "WHERE timestamp >= %s AND rule_action = 'block'",
-                [cutoff]
-            )
-            blocked = cur.fetchone()['count']
-
-            # Threat count (score > 50)
-            cur.execute(
-                "SELECT COUNT(*) as count FROM logs "
-                "WHERE timestamp >= %s AND threat_score > 50",
-                [cutoff]
-            )
-            threats = cur.fetchone()['count']
-
-            # Top blocked countries
-            cur.execute(
-                "SELECT geo_country as country, COUNT(*) as count FROM logs "
-                "WHERE timestamp >= %s AND rule_action = 'block' AND geo_country IS NOT NULL "
-                "GROUP BY geo_country ORDER BY count DESC LIMIT 10",
-                [cutoff]
-            )
-            top_blocked_countries = [dict(r) for r in cur.fetchall()]
-
-            exclude_ips = _build_exclude_ips()
-            top_blocked_ips = _query_top_blocked_ips(cur, cutoff, exclude_ips)
-            top_blocked_internal_ips = _query_top_blocked_internal_ips(cur, cutoff)
-            top_threat_ips = _query_top_threat_ips(cur, cutoff, exclude_ips)
-
-            logs_over_time = _query_logs_over_time(cur, cutoff, bucket)
-            traffic_by_action = _query_traffic_by_action(cur, cutoff, bucket)
-
-            # Direction breakdown
-            cur.execute(
-                "SELECT direction, COUNT(*) as count FROM logs "
-                "WHERE timestamp >= %s AND direction IS NOT NULL "
-                "GROUP BY direction ORDER BY count DESC",
-                [cutoff]
-            )
-            by_direction = {r['direction']: r['count'] for r in cur.fetchall()}
-
-            top_dns = _query_top_dns(cur, cutoff)
-
-            # Top blocked services
-            cur.execute(
-                "SELECT service_name, COUNT(*) as count FROM logs "
-                "WHERE timestamp >= %s AND rule_action = 'block' AND service_name IS NOT NULL "
-                "GROUP BY service_name ORDER BY count DESC LIMIT 10",
-                [cutoff]
-            )
-            top_blocked_services = [dict(r) for r in cur.fetchall()]
-
-            # Allowed count
-            cur.execute(
-                "SELECT COUNT(*) as count FROM logs "
-                "WHERE timestamp >= %s AND log_type = 'firewall' AND rule_action = 'allow'",
-                [cutoff]
-            )
-            allowed = cur.fetchone()['count']
-
-            top_allowed_destinations = _query_top_allowed_destinations(cur, cutoff, exclude_ips)
-
-            # Top allowed countries (outbound destinations)
-            cur.execute(
-                "SELECT geo_country as country, COUNT(*) as count FROM logs "
-                "WHERE timestamp >= %s AND rule_action = 'allow' "
-                "AND geo_country IS NOT NULL AND direction = 'outbound' "
-                "GROUP BY geo_country ORDER BY count DESC LIMIT 10",
-                [cutoff]
-            )
-            top_allowed_countries = [dict(r) for r in cur.fetchall()]
-
-            # Top allowed services
-            cur.execute(
-                "SELECT service_name, COUNT(*) as count FROM logs "
-                "WHERE timestamp >= %s AND rule_action = 'allow' AND service_name IS NOT NULL "
-                "GROUP BY service_name ORDER BY count DESC LIMIT 10",
-                [cutoff]
-            )
-            top_allowed_services = [dict(r) for r in cur.fetchall()]
-
-            top_active_internal_ips = _query_top_active_internal_ips(cur, cutoff)
-
-            _annotate_internal_ips(top_blocked_internal_ips, top_active_internal_ips)
-
-        conn.commit()
-        return {
-            'time_range': time_range,
-            'total': total,
-            'by_type': by_type,
-            'blocked': blocked,
-            'threats': threats,
-            'allowed': allowed,
-            'by_direction': by_direction,
-            'top_blocked_countries': top_blocked_countries,
-            'top_blocked_ips': top_blocked_ips,
-            'top_blocked_internal_ips': top_blocked_internal_ips,
-            'top_threat_ips': top_threat_ips,
-            'top_blocked_services': top_blocked_services,
-            'top_allowed_destinations': top_allowed_destinations,
-            'top_allowed_countries': top_allowed_countries,
-            'top_allowed_services': top_allowed_services,
-            'top_active_internal_ips': top_active_internal_ips,
-            'top_dns': top_dns,
-            'logs_per_hour': logs_over_time,  # backward-compat alias for logs_over_time
-            'logs_over_time': logs_over_time,
-            'traffic_by_action': traffic_by_action,
-        }
-    except Exception as e:
-        conn.rollback()
-        logger.exception("Error fetching stats")
-        raise HTTPException(status_code=500, detail="Internal server error") from e
-    finally:
-        put_conn(conn)
+    The union of /api/stats/overview, /tables and /charts, so it takes their
+    hourly-rollup path and shares their response cache instead of re-running
+    every aggregation over raw `logs` (which timed out on 7d+ ranges).
+    """
+    return {
+        **get_stats_overview(time_range=time_range),
+        **get_stats_tables(time_range=time_range),
+        **get_stats_charts(time_range=time_range),
+    }
 
 
 @router.get("/api/stats/overview")
