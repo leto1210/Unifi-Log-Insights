@@ -224,6 +224,15 @@ def create_index_online(conn, name: str, definition: str) -> None:
             if cur.fetchone():
                 continue  # this partition's index is already attached
             child = f"{name}__{part}"
+            cur.execute("SELECT x.indisvalid FROM pg_index x "
+                        "WHERE x.indexrelid = to_regclass(%s)", [f'public.{child}'])
+            row = cur.fetchone()
+            if row and not row[0]:
+                # An interrupted CONCURRENTLY build (shutdown, cancel) leaves an
+                # INVALID index that IF NOT EXISTS would keep forever, so the
+                # parent could never turn valid: rebuild it.
+                logger.warning("Rebuilding invalid partition index %s", child)
+                cur.execute(f"DROP INDEX CONCURRENTLY IF EXISTS {child}")
             cur.execute(f"CREATE INDEX CONCURRENTLY IF NOT EXISTS {child} ON {part} {definition}")
             cur.execute(f"ALTER INDEX {name} ATTACH PARTITION {child}")
 

@@ -69,8 +69,24 @@ __all__ = [
     '_log_periodic_stats',
     '_refresh_network_identity_from_logs',
     '_use_log_identity_detection',
+    '_start_post_boot_indexes',
     'main',
 ]
+
+
+def _start_post_boot_indexes(db):
+    """Run post-boot index maintenance in a daemon thread and return the thread.
+
+    CREATE INDEX CONCURRENTLY never blocks writers, but on a large logs table it
+    runs for tens of minutes. Run inline, it held the receiver before the UDP
+    listener opened, and every syslog datagram sent meanwhile was lost
+    (2026-11-27 prod incident). The builds are resumable, so a shutdown
+    mid-build just leaves them for the next boot to finish.
+    """
+    thread = threading.Thread(target=db.ensure_post_boot_indexes,
+                              name='post-boot-indexes', daemon=True)
+    thread.start()
+    return thread
 
 
 def main():
@@ -96,8 +112,9 @@ def main():
         logger.warning("Partition maintenance at boot failed — scheduler retries hourly",
                        exc_info=True)
 
-    # Create performance indexes that require CONCURRENTLY (existing installs)
-    db.ensure_post_boot_indexes()
+    # Create performance indexes that require CONCURRENTLY (existing installs),
+    # off the startup path so ingestion never waits for them.
+    _start_post_boot_indexes(db)
 
     # Load system configuration and apply to parsers module
     # Check for existing user migration
