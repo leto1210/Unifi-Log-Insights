@@ -828,12 +828,14 @@ class Database:
         and issues drops with IF EXISTS.
 
         A short lock_timeout is set before the drop loop so a stuck
-        DROP CONCURRENTLY cannot stall receiver startup indefinitely — on
-        timeout the drop retries on the next boot.
+        DROP CONCURRENTLY cannot hold the maintenance thread indefinitely —
+        on timeout the drop retries on the next boot.
 
         Must be called from the receiver startup path only — not from
         Database.connect() — to avoid the API and receiver both racing on
-        the same concurrent index creation.
+        the same concurrent index creation. The receiver runs it in a
+        background thread (main._start_post_boot_indexes): a build can take
+        tens of minutes on a large table and must not delay ingestion.
         """
         try:
             conn = psycopg2.connect(**self.conn_params)

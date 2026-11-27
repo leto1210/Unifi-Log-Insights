@@ -248,3 +248,28 @@ def test_row_estimate_sums_leaf_partitions(fresh_db):
     with raw.cursor() as cur:
         cur.execute("ANALYZE logs")
     assert _one(raw, partitioning.LOGS_ROW_ESTIMATE_SQL) == 20
+
+
+def test_invalid_partition_index_is_rebuilt(fresh_db):
+    """An interrupted build's INVALID partition index is rebuilt, so the parent turns valid.
+
+    Reproduces the 2026-11-27 prod state: parent ON ONLY logs (invalid) plus a
+    cancelled CONCURRENTLY child that IF NOT EXISTS would otherwise keep.
+    """
+    params, raw, opened = fresh_db
+    _connect(params, opened)
+    from db.schema import POST_BOOT_INDEXES
+    idx = next(i for i in POST_BOOT_INDEXES if i['name'] == 'idx_logs_block_src_cover')
+    name, child = idx['name'], f"{idx['name']}__logs_default"
+    with raw.cursor() as cur:
+        cur.execute(f"DROP INDEX IF EXISTS {name}")
+        cur.execute(f"CREATE INDEX {name} ON ONLY logs {idx['def']}")
+        cur.execute(f"CREATE INDEX {child} ON logs_default {idx['def']}")
+        cur.execute("UPDATE pg_index SET indisvalid = false WHERE indexrelid = %s::regclass",
+                    [child])
+    assert _index_valid(raw, child) is False
+
+    partitioning.create_index_online(raw, name, idx['def'])
+
+    assert _index_valid(raw, child) is True
+    assert _index_valid(raw, name) is True
