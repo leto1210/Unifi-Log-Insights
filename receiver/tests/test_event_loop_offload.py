@@ -97,3 +97,14 @@ def test_mcp_post_runs_auth_and_tools_off_the_event_loop(mcp_module, monkeypatch
     assert resp.status_code == 200
     assert seen['authorize'] != seen['loop']
     assert seen['tool'] != seen['loop']
+
+
+def test_lifespan_runs_auth_route_coverage_check(api_module, monkeypatch):
+    """Startup must still fail closed on an /api/ route outside the auth policy."""
+    monkeypatch.setattr(api_module, 'init_proxy_token', lambda: None)
+    monkeypatch.setattr(api_module, 'log_proxy_token', lambda: None)
+    api_module.app.add_api_route('/api/_uncovered_probe', lambda: {})
+
+    with pytest.raises(RuntimeError, match='_uncovered_probe'):
+        with TestClient(api_module.app):
+            pass
