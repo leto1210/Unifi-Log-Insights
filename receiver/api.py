@@ -8,6 +8,7 @@ Route handlers live in the `routes/` package; shared state in `deps.py`.
 import logging
 import os
 import re
+from contextlib import asynccontextmanager
 from pathlib import Path
 from urllib.parse import unquote
 
@@ -56,7 +57,15 @@ logger = logging.getLogger('api')
 
 # ── App ──────────────────────────────────────────────────────────────────────
 
-app = FastAPI(title="UniFi Log Insight API", version=APP_VERSION)
+@asynccontextmanager
+async def _lifespan(_app):
+    """Run startup checks; the hooks are defined further down this module."""
+    _configure_access_logging()
+    _verify_auth_route_coverage()
+    yield
+
+
+app = FastAPI(title="UniFi Log Insight API", version=APP_VERSION, lifespan=_lifespan)
 
 class DualCORSMiddleware(BaseHTTPMiddleware):
     """Two-tier CORS: restricted for cookie-auth, permissive for token-auth.
@@ -259,8 +268,8 @@ class _QuietAccessFilter(logging.Filter):
         return True
 
 
-@app.on_event("startup")
 def _configure_access_logging():
+    """Quiet noisy access-log lines and announce the proxy token."""
     logging.getLogger("uvicorn.access").addFilter(_QuietAccessFilter())
     init_proxy_token()  # Initialize token before logging it
     log_proxy_token()
@@ -288,7 +297,6 @@ app.include_router(adguard_router)
 
 # ── Startup: verify all /api/ routes are covered by auth policy ─────────────
 
-@app.on_event("startup")
 def _verify_auth_route_coverage():
     """Fail-closed assertion: every /api/ route must be in the public allowlist,
     the auth-session-only set, or matched by the scope map.
