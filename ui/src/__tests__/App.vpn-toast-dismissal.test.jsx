@@ -64,11 +64,9 @@ vi.mock('../components/SetupWizard', () => ({ default: () => <div /> }))
 vi.mock('../components/SettingsOverlay', () => ({ default: () => <div /> }))
 vi.mock('../components/Dashboard', () => ({
   default: () => <div />,
-  DashboardSkeleton: () => <div />,
 }))
 vi.mock('../components/ThreatMap', () => ({
   default: () => <div />,
-  ThreatMapSkeleton: () => <div />,
 }))
 vi.mock('../components/FlowView', () => ({ default: () => <div /> }))
 vi.mock('../components/FlowViewSkeleton', () => ({ default: () => <div /> }))

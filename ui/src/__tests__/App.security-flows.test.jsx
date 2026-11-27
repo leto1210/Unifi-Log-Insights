@@ -21,8 +21,8 @@ vi.mock('../vpnUtils', () => ({ isVpnInterface: vi.fn(() => false) }))
 vi.mock('../components/LogStream', () => ({ default: () => <div>Log stream</div> }))
 vi.mock('../components/SetupWizard', () => ({ default: () => <div>Setup wizard</div> }))
 vi.mock('../components/SettingsOverlay', () => ({ default: () => <div>Settings</div> }))
-vi.mock('../components/Dashboard', () => ({ default: () => <div />, DashboardSkeleton: () => <div /> }))
-vi.mock('../components/ThreatMap', () => ({ default: () => <div />, ThreatMapSkeleton: () => <div /> }))
+vi.mock('../components/Dashboard', () => ({ default: () => <div /> }))
+vi.mock('../components/ThreatMap', () => ({ default: () => <div /> }))
 vi.mock('../components/FlowView', () => ({ default: () => <div /> }))
 
 import App from '../App'

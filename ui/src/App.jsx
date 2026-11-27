@@ -2,8 +2,8 @@ import React, { Suspense, useState, useEffect, useLayoutEffect, useMemo, useCall
 import LogStream from './components/LogStream'
 import SetupWizard from './components/SetupWizard'
 import SettingsOverlay from './components/SettingsOverlay'
-import { DashboardSkeleton } from './components/Dashboard'
-import { ThreatMapSkeleton } from './components/ThreatMap'
+import DashboardSkeleton from './components/DashboardSkeleton'
+import ThreatMapSkeleton from './components/ThreatMapSkeleton'
 import FlowViewSkeleton from './components/FlowViewSkeleton'
 
 const Dashboard = React.lazy(() => import('./components/Dashboard'))
