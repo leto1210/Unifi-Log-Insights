@@ -59,6 +59,16 @@ If the DB genuinely won't shrink, check `pg_stat_user_tables.n_dead_tup` for the
 
 `Settings > MCP > Enable MCP server` is off, or `AUTH_ENABLED=false`. Enable both. MCP requires auth to be on so tokens have meaning.
 
+## MCP stats tools time out, or the agent marks the server "unreachable"
+
+Symptom: `get_log_stats` / `get_top_threat_ips` on `24h` or `7d` fail. On releases before 3.8.5-beta.6 the agent only sees `Internal server error`. Some MCP clients count tool errors against the server; Hermes, for example, logs `MCP server 'unifi-log-insight' is unreachable after N consecutive failures` and then blocks every other tool for about a minute. The app log shows `Error fetching stats tables … QueryCanceled: canceling statement due to statement timeout`. The audit log keeps each failed call: `SELECT created_at, detail FROM audit_log WHERE action='api_call' AND (detail->>'success')::bool = false ORDER BY created_at DESC LIMIT 20;`.
+
+Cause: before 3.8.5-beta.7, the per-IP top-N tables (blocked IPs, threat IPs, allowed destinations, active internal IPs) scanned raw `logs`. On a 60 M+ row table, a 7d range seq-scans the whole legacy partition, which takes minutes.
+
+Since 3.8.5-beta.7 these tables come from the hourly rollup (`logs_hourly_ip_stats`). The stats tables transaction gets a 90 s `statement_timeout`. A timeout returns `504 Stats query timed out for time_range=<r>; retry with a shorter range`, so agents can narrow the range instead of retrying.
+
+Right after upgrading, the rollup re-backfills every hour in the background, newest first. Until it reaches the start of a range, that range keeps the raw path and can still time out. To check progress, run `SELECT version, count(*), min(hour), max(hour) FROM logs_hourly_stats_hours GROUP BY version;`. Hours at the current version are done.
+
 ## UniFi status shows `connected: false`
 
 Log line:
