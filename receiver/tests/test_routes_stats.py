@@ -305,6 +305,30 @@ class TestStatsTables:
         body = resp.json()
         assert 'detail' in body
 
+    def test_tables_statement_timeout_is_actionable_504(self, client):
+        """Raised per-txn timeout is set first; a timeout surfaces as a 504 naming
+        the range (MCP agents retried the opaque 500 into a circuit breaker)."""
+        from psycopg2.errors import QueryCanceled
+        test_client, mock_deps, _ = client
+
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+
+        def execute(sql, *_a):
+            if not sql.startswith('SET LOCAL'):
+                raise QueryCanceled('canceling statement due to statement timeout')
+        mock_cursor.execute.side_effect = execute
+        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
+        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+        mock_deps.get_conn.return_value = mock_conn
+
+        resp = test_client.get('/api/stats/tables?time_range=7d')
+        assert resp.status_code == 504
+        assert 'time_range=7d' in resp.json()['detail']
+        first_sql = mock_cursor.execute.call_args_list[0].args[0]
+        assert first_sql == "SET LOCAL statement_timeout = '90s'"
+        mock_conn.rollback.assert_called_once()
+
 
 def test_query_by_type_sorts_desc_and_drops_zero_counts():
     """_query_by_type orders by count desc and omits types with no rows in range."""
