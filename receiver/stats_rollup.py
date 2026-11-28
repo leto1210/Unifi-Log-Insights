@@ -8,8 +8,16 @@ apart by `dim` (= GROUPING(geo_country, service_name)):
     DIM_COUNTRY  (log_type, rule_action, direction, geo_country)  → top countries
     DIM_SERVICE  (log_type, rule_action, service_name)            → top services
 
+`logs_hourly_ip_stats` holds per-hour, per-IP counts (plus the MAX() detail
+columns the top-N tables show) for the three IP slices in `_IP_KINDS`. Its
+cardinality is bounded by distinct IPs per hour (scanners, destinations), far
+below the raw rows the per-IP tables used to scan.
+
 `logs_hourly_stats_hours` lists the hours that have been computed, so an
-hour with no logs is distinguishable from one not rolled up yet.
+hour with no logs is distinguishable from one not rolled up yet. Its
+`version` lets a schema change (new table or dimension) re-backfill every
+hour without a destructive migration: hours below ROLLUP_VERSION count as
+missing on both the write and the read side.
 
 Write side (receiver process): `StatsRollupTask` recomputes the last
 `RECENT_HOURS` closed hours every `REFRESH_INTERVAL_SECS` (late Pi-hole /
@@ -21,8 +29,8 @@ Read side (API): `plan()` returns the closed-hour span the rollup fully
 covers; `counts()` sums raw `logs` on the partial edges and the rollup in the
 middle. Ranges under `MIN_RANGE` or not fully covered stay on raw `logs`.
 
-Not rolled up on purpose: threat_score (backfilled hours/days after insert)
-and per-IP top-N tables (high cardinality).
+Not rolled up on purpose: threat_score (backfilled hours/days after insert);
+readers re-join `ip_threats` for the current score instead.
 
 Dependency-free (no db/deps imports) so the API and tests can import it alone.
 """
@@ -36,6 +44,17 @@ logger = logging.getLogger('stats_rollup')
 
 HOUR = timedelta(hours=1)
 DIM_COUNTRY, DIM_SERVICE, DIM_BASE = 1, 2, 3
+ROLLUP_VERSION = 2  # 2: + logs_hourly_ip_stats
+
+# Per-IP slices: kind → (IP column, filter). Runtime filters (WAN/gateway
+# exclusions, public/private split of blocked sources) are left to readers.
+IP_BLOCKED_SRC, IP_ALLOWED_INTERNAL_SRC, IP_ALLOWED_PUBLIC_DST = 1, 2, 3
+_IP_KINDS = {
+    IP_BLOCKED_SRC: ('src_ip', "rule_action = 'block' AND src_ip IS NOT NULL"),
+    IP_ALLOWED_INTERNAL_SRC: ('src_ip', "rule_action = 'allow' AND src_ip IS NOT NULL "
+                                        "AND NOT is_public_inet(src_ip)"),
+    IP_ALLOWED_PUBLIC_DST: ('dst_ip', "rule_action = 'allow' AND is_public_inet(dst_ip)"),
+}
 
 REFRESH_INTERVAL_SECS = 300
 RECENT_HOURS = 2            # closed hours recomputed on every refresh
@@ -60,6 +79,21 @@ _ROLLUP_SQL = """
 """
 
 
+def _ip_raw_sql(kind: int, bounded: bool) -> str:
+    """Per-(ip, log_type) partial aggregate of raw logs for one kind.
+
+    Columns: ip, log_type, n, last_seen, geo_country, geo_city, asn_name, rdns.
+
+    Binds timestamp >= %s, plus < %s when bounded.
+    """
+    col, where = _IP_KINDS[kind]
+    return (f"SELECT {col} AS ip, log_type, COUNT(*) AS n, MAX(timestamp) AS last_seen, "
+            "MAX(geo_country) AS geo_country, MAX(geo_city) AS geo_city, "
+            "MAX(asn_name) AS asn_name, MAX(rdns) AS rdns "
+            "FROM logs WHERE timestamp >= %s" + (" AND timestamp < %s" if bounded else "")
+            + f" AND {where} GROUP BY {col}, log_type")
+
+
 def floor_hour(ts: datetime) -> datetime:
     """Truncate a datetime to the start of its hour."""
     return ts.replace(minute=0, second=0, microsecond=0)
@@ -79,10 +113,18 @@ def rollup_hour(db, hour: datetime) -> None:
         with conn.cursor() as cur:
             cur.execute("DELETE FROM logs_hourly_stats WHERE hour = %s", [hour])
             cur.execute(_ROLLUP_SQL, {'h': hour})
+            cur.execute("DELETE FROM logs_hourly_ip_stats WHERE hour = %s", [hour])
+            for kind in _IP_KINDS:
+                cur.execute(
+                    "INSERT INTO logs_hourly_ip_stats (hour, kind, ip, log_type, count, last_seen, "
+                    "geo_country, geo_city, asn_name, rdns) "
+                    f"SELECT %s, %s, r.* FROM ({_ip_raw_sql(kind, True)}) r",
+                    [hour, kind, hour, hour + HOUR],
+                )
             cur.execute(
-                "INSERT INTO logs_hourly_stats_hours (hour) VALUES (%s) "
-                "ON CONFLICT (hour) DO UPDATE SET computed_at = NOW()",
-                [hour],
+                "INSERT INTO logs_hourly_stats_hours (hour, version) VALUES (%s, %s) "
+                "ON CONFLICT (hour) DO UPDATE SET computed_at = NOW(), version = EXCLUDED.version",
+                [hour, ROLLUP_VERSION],
             )
 
 
@@ -92,10 +134,11 @@ def purge(db, general_days: int, dns_days: int) -> None:
     general_cutoff = now - timedelta(days=general_days)
     with db.get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("DELETE FROM logs_hourly_stats WHERE hour < %s", [general_cutoff])
-            cur.execute("DELETE FROM logs_hourly_stats_hours WHERE hour < %s", [general_cutoff])
-            cur.execute("DELETE FROM logs_hourly_stats WHERE log_type = 'dns' AND hour < %s",
-                        [now - timedelta(days=dns_days)])
+            for table in ('logs_hourly_stats', 'logs_hourly_ip_stats', 'logs_hourly_stats_hours'):
+                cur.execute(f"DELETE FROM {table} WHERE hour < %s", [general_cutoff])
+            for table in ('logs_hourly_stats', 'logs_hourly_ip_stats'):
+                cur.execute(f"DELETE FROM {table} WHERE log_type = 'dns' AND hour < %s",
+                            [now - timedelta(days=dns_days)])
 
 
 def _next_missing_hour(db, horizon: datetime, last_closed: datetime):
@@ -104,9 +147,10 @@ def _next_missing_hour(db, horizon: datetime, last_closed: datetime):
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT h FROM generate_series(%s::timestamptz, %s::timestamptz, interval '1 hour') h "
-                "WHERE NOT EXISTS (SELECT 1 FROM logs_hourly_stats_hours c WHERE c.hour = h) "
+                "WHERE NOT EXISTS (SELECT 1 FROM logs_hourly_stats_hours c "
+                "                 WHERE c.hour = h AND c.version >= %s) "
                 "ORDER BY h DESC LIMIT 1",
-                [horizon, last_closed],
+                [horizon, last_closed, ROLLUP_VERSION],
             )
             row = cur.fetchone()
             return row[0] if row else None
@@ -183,8 +227,8 @@ def plan(cur, cutoff: datetime, now: datetime):
     h0 = ceil_hour(cutoff)
     cur.execute(
         "SELECT COUNT(*) AS n, MAX(hour) AS last FROM logs_hourly_stats_hours "
-        "WHERE hour >= %s AND hour < %s",
-        [h0, floor_hour(now)],
+        "WHERE hour >= %s AND hour < %s AND version >= %s",
+        [h0, floor_hour(now), ROLLUP_VERSION],
     )
     row = cur.fetchone()
     if not row or not row['n']:
@@ -225,3 +269,30 @@ def counts(cur, cutoff: datetime, span, group, where: str = 'TRUE', params=(),
     run('logs_hourly_stats', 'hour', 'SUM(count)', h0, h1, ' AND dim = %s', [dim])
     run('logs', 'timestamp', 'COUNT(*)', h1, None)  # open-ended, like the raw queries
     return result
+
+
+def ip_source(cutoff: datetime, span, kind: int):
+    """(sql, params): a FROM-clause relation `u` of per-IP partial aggregates over [cutoff, now).
+
+    Columns as in _ip_raw_sql(), one row per (part, ip, log_type): callers re-aggregate
+    with GROUP BY ip — SUM(n), MAX() of the rest — and can filter on `ip`.
+    span None (plan() declined) → raw logs only; otherwise raw head + rollup
+    middle + open raw tail, as in counts(), but in one statement so the
+    caller's ORDER BY … LIMIT ranks the merged totals.
+    """
+    # ponytail: cost is distinct IPs/hour × hours (~6 s for 7d at 38k allowed
+    # destinations/hour); add a daily compaction of logs_hourly_ip_stats if
+    # 30d+ ranges must answer that fast too.
+    if span is None:
+        return f"({_ip_raw_sql(kind, False)}) AS u", [cutoff]
+    h0, h1 = span
+    parts, params = [], []
+    if cutoff < h0:
+        parts.append(_ip_raw_sql(kind, True))
+        params += [cutoff, h0]
+    parts.append("SELECT ip, log_type, count AS n, last_seen, geo_country, geo_city, asn_name, rdns "
+                 "FROM logs_hourly_ip_stats WHERE hour >= %s AND hour < %s AND kind = %s")
+    params += [h0, h1, kind]
+    parts.append(_ip_raw_sql(kind, False))
+    params.append(h1)
+    return "(" + " UNION ALL ".join(parts) + ") AS u", params

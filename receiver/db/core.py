@@ -563,6 +563,23 @@ class Database:
                 hour        TIMESTAMPTZ PRIMARY KEY,
                 computed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )""",
+            # Hours rolled up before logs_hourly_ip_stats existed stay at 1, so
+            # stats_rollup recomputes them (ROLLUP_VERSION) instead of serving
+            # empty per-IP tops.
+            "ALTER TABLE logs_hourly_stats_hours ADD COLUMN IF NOT EXISTS version SMALLINT NOT NULL DEFAULT 1",
+            """CREATE TABLE IF NOT EXISTS logs_hourly_ip_stats (
+                hour        TIMESTAMPTZ NOT NULL,
+                kind        SMALLINT NOT NULL,
+                ip          INET NOT NULL,
+                log_type    VARCHAR(20),
+                count       BIGINT NOT NULL,
+                last_seen   TIMESTAMPTZ NOT NULL,
+                geo_country VARCHAR(2),
+                geo_city    VARCHAR(100),
+                asn_name    VARCHAR(255),
+                rdns        VARCHAR(255)
+            )""",
+            "CREATE INDEX IF NOT EXISTS idx_logs_hourly_ip_stats_hour_kind ON logs_hourly_ip_stats (hour, kind)",
             # ── AdGuard Home integration ──────────────────────────────────────
             # adguard_logs is always a new table, so index builds are instantaneous
             # — ACCESS EXCLUSIVE lock risk is zero. Non-concurrent CREATE INDEX is
