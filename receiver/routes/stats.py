@@ -9,6 +9,7 @@ from typing import Optional
 
 from fastapi import APIRouter, Query, HTTPException
 from fastapi.responses import StreamingResponse
+from psycopg2.errors import QueryCanceled
 from psycopg2.extras import RealDictCursor
 
 from db import get_config, get_wan_ips_from_config
@@ -25,6 +26,12 @@ import stats_rollup
 # the multi-million-row `logs` table. Cache for 30 s so repeated loads /
 # tab-flipping don't re-fire the whole cascade. First hit still pays full cost.
 _STATS_TTL_SECS = 30
+
+# The per-IP top-N tables are not in the hourly rollup and scan raw `logs`:
+# ~4 s warm for 24h, but past 30 s under ingest contention or a cold cache.
+# ponytail: raw scans still exceed this on 7d+ while logs_legacy is in range;
+# roll the per-IP tables up if long ranges must always answer.
+_TABLES_STATEMENT_TIMEOUT = '90s'
 
 logger = logging.getLogger('api.stats')
 
@@ -468,6 +475,7 @@ def get_stats_tables(
     conn = get_conn()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(f"SET LOCAL statement_timeout = '{_TABLES_STATEMENT_TIMEOUT}'")
             # --- WAN IP exclusion (shared across multiple queries) ---
             exclude_ips = _build_exclude_ips()
 
@@ -525,6 +533,15 @@ def get_stats_tables(
             'top_active_internal_ips': top_active_internal_ips,
             'top_dns': top_dns,
         }
+    except QueryCanceled as e:
+        # Actionable for MCP agents: a generic 500 makes them retry the same
+        # range until their client trips its circuit breaker.
+        conn.rollback()
+        logger.warning("Stats tables timed out for time_range=%s", time_range)
+        raise HTTPException(
+            status_code=504,
+            detail=f"Stats query timed out for time_range={time_range}; retry with a shorter range",
+        ) from e
     except Exception as e:
         conn.rollback()
         logger.exception("Error fetching stats tables")
