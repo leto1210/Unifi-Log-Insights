@@ -27,10 +27,8 @@ import stats_rollup
 # tab-flipping don't re-fire the whole cascade. First hit still pays full cost.
 _STATS_TTL_SECS = 30
 
-# The per-IP top-N tables are not in the hourly rollup and scan raw `logs`:
-# ~4 s warm for 24h, but past 30 s under ingest contention or a cold cache.
-# ponytail: raw scans still exceed this on 7d+ while logs_legacy is in range;
-# roll the per-IP tables up if long ranges must always answer.
+# Headroom for the raw fallback (rollup still backfilling, or ranges under
+# stats_rollup.MIN_RANGE) under ingest contention or a cold cache.
 _TABLES_STATEMENT_TIMEOUT = '90s'
 
 logger = logging.getLogger('api.stats')
@@ -85,37 +83,40 @@ def _annotate_internal_ips(*ip_lists):
                 item['vlan'] = vlan
 
 
-def _query_top_blocked_ips(cur, cutoff, exclude_ips):
-    """Top blocked external IPs (public src_ip, exclude WAN)."""
+# The per-IP helpers read stats_rollup.ip_source(): raw logs when span is
+# None, else the hourly per-IP rollup plus raw edges. Ties break on the IP so
+# both paths return the same rows.
+
+def _query_top_blocked_ips(cur, cutoff, span, exclude_ips):
+    """Top blocked external IPs (public src_ip, exclude WAN), current threat score from ip_threats."""
+    src, params = stats_rollup.ip_source(cutoff, span, stats_rollup.IP_BLOCKED_SRC)
     cur.execute(
-        "SELECT host(src_ip) as ip, COUNT(*) as count, "
-        "MAX(geo_country) as country, MAX(asn_name) as asn, "
-        "MAX(threat_score) as threat_score "
-        "FROM logs "
-        "WHERE timestamp >= %s AND rule_action = 'block' AND src_ip IS NOT NULL "
-        "AND host(src_ip) != ALL(%s) "
-        "AND is_public_inet(src_ip) "
-        "GROUP BY src_ip ORDER BY count DESC LIMIT 10",
-        [cutoff, exclude_ips]
+        "WITH top AS ("
+        "  SELECT u.ip, SUM(n)::bigint AS count, MAX(geo_country) AS country, MAX(asn_name) AS asn "
+        f"  FROM {src} WHERE is_public_inet(u.ip) AND host(u.ip) != ALL(%s) "
+        "  GROUP BY u.ip ORDER BY count DESC, u.ip LIMIT 10"
+        ") SELECT host(top.ip) AS ip, top.count, top.country, top.asn, t.threat_score "
+        "FROM top LEFT JOIN ip_threats t ON t.ip = top.ip "
+        "ORDER BY top.count DESC, top.ip",
+        params + [exclude_ips]
     )
     return [dict(r) for r in cur.fetchall()]
 
 
-def _query_top_blocked_internal_ips(cur, cutoff):
+def _query_top_blocked_internal_ips(cur, cutoff, span):
     """Top blocked internal IPs with device name enrichment."""
+    src, params = stats_rollup.ip_source(cutoff, span, stats_rollup.IP_BLOCKED_SRC)
     cur.execute(
         "WITH top_ips AS ("
-        "  SELECT src_ip, host(src_ip) as ip, COUNT(*) as count "
-        "  FROM logs "
-        "  WHERE timestamp >= %s AND rule_action = 'block' AND src_ip IS NOT NULL "
-        "  AND NOT is_public_inet(src_ip) "
-        "  GROUP BY src_ip ORDER BY count DESC LIMIT 10"
+        "  SELECT u.ip AS src_ip, host(u.ip) AS ip, SUM(n)::bigint AS count "
+        f"  FROM {src} WHERE NOT is_public_inet(u.ip) "
+        "  GROUP BY u.ip ORDER BY count DESC, u.ip LIMIT 10"
         ") SELECT t.ip, t.count, "
         + device_name_coalesce('c', column_alias='device_name') + " "
         "FROM top_ips t "
         + device_name_client_lateral('t.src_ip', 'c', recency_expr='%s') + " "
-        "ORDER BY t.count DESC",
-        [cutoff, cutoff]
+        "ORDER BY t.count DESC, t.src_ip",
+        params + [cutoff]
     )
     return [dict(r) for r in cur.fetchall()]
 
@@ -145,21 +146,26 @@ def _query_by_type(cur, cutoff):
     return {r['log_type']: r['count'] for r in rows if r['count']}
 
 
-def _query_top_threat_ips(cur, cutoff, exclude_ips):
-    """Top threat IPs with categories from ip_threats and last_seen ISO format."""
+def _query_top_threat_ips(cur, cutoff, span, exclude_ips):
+    """Top threat IPs: blocked sources whose ip_threats score is > 50, last_seen in ISO format.
+
+    Score and categories come from ip_threats at read time rather than from
+    logs.threat_score, which is backfilled hours or days after insert (and so
+    cannot be rolled up). Only firewall blocks are ever threat-scored, so
+    blocked sources are the whole population; count is their blocked hits.
+    """
+    src, params = stats_rollup.ip_source(cutoff, span, stats_rollup.IP_BLOCKED_SRC)
     cur.execute(
-        "SELECT host(l.src_ip) as ip, COUNT(*) as count, "
-        "MAX(l.geo_country) as country, MAX(l.asn_name) as asn, "
-        "MAX(l.geo_city) as city, MAX(l.rdns) as rdns, "
-        "MAX(l.threat_score) as threat_score, "
-        "COALESCE(MAX(l.threat_categories), MAX(t.threat_categories)) as threat_categories, "
-        "MAX(l.timestamp) as last_seen "
-        "FROM logs l "
-        "LEFT JOIN ip_threats t ON l.src_ip = t.ip "
-        "WHERE l.timestamp >= %s AND l.threat_score > 50 AND l.src_ip IS NOT NULL "
-        "AND host(l.src_ip) != ALL(%s) "
-        "GROUP BY l.src_ip ORDER BY max(l.threat_score) DESC, count DESC LIMIT 10",
-        [cutoff, exclude_ips]
+        "WITH agg AS ("
+        "  SELECT u.ip, SUM(n)::bigint AS count, MAX(geo_country) AS country, "
+        "  MAX(asn_name) AS asn, MAX(geo_city) AS city, MAX(rdns) AS rdns, "
+        "  MAX(last_seen) AS last_seen "
+        f"  FROM {src} WHERE host(u.ip) != ALL(%s) GROUP BY u.ip"
+        ") SELECT host(a.ip) AS ip, a.count, a.country, a.asn, a.city, a.rdns, "
+        "t.threat_score, t.threat_categories, a.last_seen "
+        "FROM agg a JOIN ip_threats t ON t.ip = a.ip AND t.threat_score > 50 "
+        "ORDER BY t.threat_score DESC, a.count DESC, a.ip LIMIT 10",
+        params + [exclude_ips]
     )
     results = []
     for r in cur.fetchall():
@@ -170,17 +176,15 @@ def _query_top_threat_ips(cur, cutoff, exclude_ips):
     return results
 
 
-def _query_top_allowed_destinations(cur, cutoff, exclude_ips):
+def _query_top_allowed_destinations(cur, cutoff, span, exclude_ips):
     """Top allowed external destinations (public dst_ip, exclude WAN)."""
+    src, params = stats_rollup.ip_source(cutoff, span, stats_rollup.IP_ALLOWED_PUBLIC_DST)
     cur.execute(
-        "SELECT host(dst_ip) as ip, COUNT(*) as count, "
-        "MAX(geo_country) as country, MAX(asn_name) as asn "
-        "FROM logs "
-        "WHERE timestamp >= %s AND rule_action = 'allow' AND dst_ip IS NOT NULL "
-        "AND host(dst_ip) != ALL(%s) "
-        "AND is_public_inet(dst_ip) "
-        "GROUP BY dst_ip ORDER BY count DESC LIMIT 10",
-        [cutoff, exclude_ips]
+        "SELECT host(u.ip) AS ip, SUM(n)::bigint AS count, "
+        "MAX(geo_country) AS country, MAX(asn_name) AS asn "
+        f"FROM {src} WHERE host(u.ip) != ALL(%s) "
+        "GROUP BY u.ip ORDER BY count DESC, u.ip LIMIT 10",
+        params + [exclude_ips]
     )
     return [dict(r) for r in cur.fetchall()]
 
@@ -256,25 +260,21 @@ def _query_top_dns(cur, cutoff):
     return [dict(r) for r in cur.fetchall()]
 
 
-def _query_top_active_internal_ips(cur, cutoff):
+def _query_top_active_internal_ips(cur, cutoff, span):
     """Top active internal IPs (most allowed traffic, exclude gateway IPs)."""
     gateway_ips = get_config(enricher_db, 'gateway_ips') or []
-    gw_filter = "  AND host(src_ip) != ALL(%s) " if gateway_ips else ""
-    params = [cutoff, gateway_ips, cutoff] if gateway_ips else [cutoff, cutoff]
+    src, params = stats_rollup.ip_source(cutoff, span, stats_rollup.IP_ALLOWED_INTERNAL_SRC)
     cur.execute(
         "WITH top_ips AS ("
-        "  SELECT src_ip, host(src_ip) as ip, COUNT(*) as count "
-        "  FROM logs "
-        "  WHERE timestamp >= %s AND rule_action = 'allow' AND src_ip IS NOT NULL "
-        "  AND NOT is_public_inet(src_ip) "
-        + gw_filter +
-        "  GROUP BY src_ip ORDER BY count DESC LIMIT 10"
+        "  SELECT u.ip AS src_ip, host(u.ip) AS ip, SUM(n)::bigint AS count "
+        f"  FROM {src} WHERE host(u.ip) != ALL(%s) "
+        "  GROUP BY u.ip ORDER BY count DESC, u.ip LIMIT 10"
         ") SELECT t.ip, t.count, "
         + device_name_coalesce('c', column_alias='device_name') + " "
         "FROM top_ips t "
         + device_name_client_lateral('t.src_ip', 'c', recency_expr='%s') + " "
-        "ORDER BY t.count DESC",
-        params
+        "ORDER BY t.count DESC, t.src_ip",
+        params + [gateway_ips, cutoff]
     )
     return [dict(r) for r in cur.fetchall()]
 
@@ -511,12 +511,12 @@ def get_stats_tables(
             top_blocked_countries, top_allowed_countries = _top_by_action(country_rows, 'country')
             top_blocked_services, top_allowed_services = _top_by_action(service_rows, 'service_name')
 
-            top_blocked_ips = _query_top_blocked_ips(cur, cutoff, exclude_ips)
-            top_blocked_internal_ips = _query_top_blocked_internal_ips(cur, cutoff)
-            top_threat_ips = _query_top_threat_ips(cur, cutoff, exclude_ips)
-            top_allowed_destinations = _query_top_allowed_destinations(cur, cutoff, exclude_ips)
+            top_blocked_ips = _query_top_blocked_ips(cur, cutoff, span, exclude_ips)
+            top_blocked_internal_ips = _query_top_blocked_internal_ips(cur, cutoff, span)
+            top_threat_ips = _query_top_threat_ips(cur, cutoff, span, exclude_ips)
+            top_allowed_destinations = _query_top_allowed_destinations(cur, cutoff, span, exclude_ips)
             top_dns = _query_top_dns(cur, cutoff)
-            top_active_internal_ips = _query_top_active_internal_ips(cur, cutoff)
+            top_active_internal_ips = _query_top_active_internal_ips(cur, cutoff, span)
 
             _annotate_internal_ips(top_blocked_internal_ips, top_active_internal_ips)
 
