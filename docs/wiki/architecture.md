@@ -219,11 +219,24 @@ flowchart TD
         BL1["30s after startup:<br>BlacklistFetcher.fetch_and_store()<br>10k known-bad IPs to ip_threats"]
     end
 
+    subgraph ROLLUP["Stats Rollup Daemon (StatsRollupTask)"]
+        direction TB
+        R1["Every 5 min:<br>recompute last 2 closed hours<br>logs_hourly_stats + logs_hourly_ip_stats"]
+        R1 --> R2["Backfill missing / old-version hours<br>newest first, one hour per statement<br>2s pause between hours"]
+    end
+
+    subgraph POSTBOOT["Post-boot Indexes (daemon thread)"]
+        direction TB
+        P1["After UDP listen:<br>CREATE INDEX CONCURRENTLY per partition<br>rebuild INVALID children<br>ingestion keeps running"]
+    end
+
     style SCHEDULER fill:#2980b9,color:#fff
     style BACKFILL fill:#8e44ad,color:#fff
     style UNIFI fill:#27ae60,color:#fff
     style CRON fill:#7f8c8d,color:#fff
     style BLACKLIST_INIT fill:#e67e22,color:#fff
+    style ROLLUP fill:#16a085,color:#fff
+    style POSTBOOT fill:#c0392b,color:#fff
 ```
 
 ## 6. API Request Flow
